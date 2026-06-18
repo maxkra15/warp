@@ -601,7 +601,7 @@ void allocate_exact_grid_from_points_host_impl(
     const VolumeRebuildCapacities capacities = rebuild_exact_capacities(scratch);
     out_grid_size = rebuildable_grid_size<BuildT>(capacities);
     out_grid = static_cast<nanovdb::Grid<nanovdb::NanoTree<BuildT>>*>(
-        wp_alloc_host(out_grid_size, "(native:volume_builder_cpu)")
+        wp_alloc_host(out_grid_size, "(native:volume_builder)")
     );
     rebuild_populate_grid(out_grid, out_grid_size, scratch, capacities, params);
 }
@@ -686,7 +686,7 @@ void allocate_rebuildable_grid_from_points_host_impl(
     out_grid_size
         = std::max(rebuildable_grid_size<BuildT>(capacities), rebuildable_grid_size<BuildT>(exact_capacities));
     out_grid = static_cast<nanovdb::Grid<nanovdb::NanoTree<BuildT>>*>(
-        wp_alloc_host(out_grid_size, "(native:volume_builder_cpu)")
+        wp_alloc_host(out_grid_size, "(native:volume_builder)")
     );
     rebuild_populate_grid(out_grid, out_grid_size, scratch, layout_capacities, params);
 
