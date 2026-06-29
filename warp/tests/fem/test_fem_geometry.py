@@ -495,6 +495,46 @@ def test_nanogrid_rebuild_edge_capacity(test, device):
     test.assertGreaterEqual(capacity.max_leaf_node_count, active.leaf_node_count)
 
 
+def test_nanogrid_rebuild_edge_hierarchy_capacity(test, device):
+    points_initial = wp.array([[0, 0, 0]], dtype=wp.int32, device=device)
+    points_rebuild = wp.array([[4095, 4095, 4095]], dtype=wp.int32, device=device)
+    status = wp.zeros(1, dtype=wp.uint32, device=device)
+
+    volume = wp.Volume.allocate_by_voxels(
+        points_initial,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=1,
+        max_leaf_nodes=1,
+        max_lower_nodes=1,
+        max_upper_nodes=1,
+        status=status,
+    )
+    geo = fem.Nanogrid(volume, rebuildable=True)
+    edge_grid = geo.edge_grid
+    edge_grid_id = edge_grid.id
+
+    geo.rebuild(points_rebuild, status=status)
+    wp.synchronize_device(device)
+
+    test.assertEqual(int(status.numpy()[0]), wp.Volume.REBUILD_SUCCESS)
+    test.assertIs(geo.edge_grid, edge_grid)
+    test.assertEqual(geo.edge_grid.id, edge_grid_id)
+
+    active = edge_grid.get_active_stats()
+    test.assertEqual(active.voxel_count, 12)
+    test.assertEqual(active.leaf_node_count, 12)
+    test.assertEqual(active.lower_node_count, 12)
+    test.assertEqual(active.upper_node_count, 12)
+
+    capacity = edge_grid.get_rebuild_info()
+    test.assertEqual(capacity.max_voxel_count, 12)
+    test.assertEqual(capacity.max_leaf_node_count, 12)
+    test.assertEqual(capacity.max_lower_node_count, 12)
+    test.assertEqual(capacity.max_upper_node_count, 12)
+
+
 def test_nanogrid_rebuild_auxiliary_status(test, device):
     points = wp.array([[0, 0, 0]], dtype=wp.int32, device=device)
     status = wp.zeros(1, dtype=wp.uint32, device=device)
@@ -648,6 +688,10 @@ def test_nanogrid_rebuild_capture(test, device):
     test.assertEqual(geo.vertex_count(), 32)
     test.assertEqual(space.topology._vertex_grid, vertex_grid_id)
     test.assertEqual(space.topology._edge_grid, edge_grid.id)
+    test.assertEqual(geo.edge_count(), 48)
+    test.assertEqual(edge_grid.get_rebuild_info().max_voxel_count, 48)
+    test.assertEqual(edge_grid.get_active_stats().voxel_count, 12)
+    test.assertEqual(space.node_count(), 80)
 
     wp.launch(
         _nanogrid_volume_counts,
@@ -677,6 +721,10 @@ def test_nanogrid_rebuild_capture(test, device):
     test.assertIs(geo.edge_grid, edge_grid)
     test.assertEqual(space.topology._vertex_grid, geo.vertex_grid.id)
     test.assertEqual(space.topology._edge_grid, edge_grid.id)
+    test.assertEqual(edge_grid.get_active_stats().voxel_count, 32)
+    test.assertEqual(geo.edge_count(), 48)
+    test.assertEqual(edge_grid.get_rebuild_info().max_voxel_count, 48)
+    test.assertEqual(space.node_count(), 80)
     np.testing.assert_array_equal(counts.numpy(), np.array([3, 20, 32]))
 
     cell_mask = wp.zeros(geo.cell_count(), dtype=int, device=device)
@@ -1085,6 +1133,12 @@ add_function_test(TestFemGeometry, "test_nanogrid", test_nanogrid, devices=cuda_
 add_function_test(TestFemGeometry, "test_nanogrid_rebuild", test_nanogrid_rebuild, devices=devices)
 add_function_test(
     TestFemGeometry, "test_nanogrid_rebuild_edge_capacity", test_nanogrid_rebuild_edge_capacity, devices=cuda_devices
+)
+add_function_test(
+    TestFemGeometry,
+    "test_nanogrid_rebuild_edge_hierarchy_capacity",
+    test_nanogrid_rebuild_edge_hierarchy_capacity,
+    devices=devices,
 )
 add_function_test(
     TestFemGeometry, "test_nanogrid_rebuild_auxiliary_status", test_nanogrid_rebuild_auxiliary_status, devices=devices
