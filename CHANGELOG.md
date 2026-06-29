@@ -115,7 +115,8 @@
 ### Fixed
 
 - Refresh automatically generated `warp.fem.Nanogrid` environment packing offsets during rebuilds so moving or growing
-  environments remain isolated, including under CUDA graph replay.
+  environments remain isolated, including under CUDA graph replay
+  ([GH-1407](https://github.com/NVIDIA/warp/issues/1407)).
 - Fix `wp.load_module()` and `wp.ScopedCapture(force_module_load=True)` after CPU launches so CUDA graph capture
   precompiles the correct CUDA kernel variant. On CUDA drivers older than 12.3 this previously raised
   `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`; on newer drivers it silently recompiled inside the capture window
