@@ -495,6 +495,72 @@ def test_nanogrid_rebuild_edge_capacity(test, device):
     test.assertGreaterEqual(capacity.max_leaf_node_count, active.leaf_node_count)
 
 
+def test_nanogrid_rebuild_auxiliary_status(test, device):
+    points = wp.array([[0, 0, 0]], dtype=wp.int32, device=device)
+    status = wp.zeros(1, dtype=wp.uint32, device=device)
+
+    volume = wp.Volume.allocate_by_voxels(
+        points,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=1,
+        max_leaf_nodes=1,
+        max_lower_nodes=1,
+        max_upper_nodes=1,
+        status=status,
+    )
+    geo = fem.Nanogrid(volume, rebuildable=True)
+    test.assertEqual(geo.edge_grid.get_active_stats().voxel_count, 12)
+
+    geo._edge_grid = wp.Volume.allocate_by_voxels(
+        points,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=1,
+        max_leaf_nodes=1,
+        max_lower_nodes=1,
+        max_upper_nodes=1,
+    )
+    geo._edge_count = 1
+
+    geo.rebuild(points, status=status)
+    test.assertTrue(int(status.numpy()[0]) & wp.Volume.REBUILD_VOXEL_CAPACITY_EXCEEDED)
+
+    status.zero_()
+    geo.rebuild_topology_from_cells(status=status)
+    test.assertTrue(int(status.numpy()[0]) & wp.Volume.REBUILD_VOXEL_CAPACITY_EXCEEDED)
+
+    if device.is_cuda:
+        status.zero_()
+        with wp.ScopedCapture(device=device, force_module_load=False) as capture:
+            geo.rebuild(points, status=status)
+
+        wp.capture_launch(capture.graph)
+        wp.synchronize_device(device)
+        test.assertTrue(int(status.numpy()[0]) & wp.Volume.REBUILD_VOXEL_CAPACITY_EXCEEDED)
+
+    cell_status = wp.zeros(1, dtype=wp.uint32, device=device)
+    cell_volume = wp.Volume.allocate_by_voxels(
+        points,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=1,
+        max_leaf_nodes=1,
+        max_lower_nodes=1,
+        max_upper_nodes=1,
+        status=cell_status,
+    )
+    cell_geo = fem.Nanogrid(cell_volume, rebuildable=True)
+    test.assertEqual(cell_geo.edge_grid.get_active_stats().voxel_count, 12)
+
+    two_points = wp.array([[0, 0, 0], [1, 0, 0]], dtype=wp.int32, device=device)
+    cell_geo.rebuild(two_points, status=cell_status)
+    test.assertTrue(int(cell_status.numpy()[0]) & wp.Volume.REBUILD_VOXEL_CAPACITY_EXCEEDED)
+
+
 def test_nanogrid_rebuild_capture(test, device):
     test.assertTrue(fem.Nanogrid.REBUILDABLE_EDGE_TOPOLOGY)
 
@@ -962,6 +1028,9 @@ add_function_test(TestFemGeometry, "test_nanogrid", test_nanogrid, devices=cuda_
 add_function_test(TestFemGeometry, "test_nanogrid_rebuild", test_nanogrid_rebuild, devices=devices)
 add_function_test(
     TestFemGeometry, "test_nanogrid_rebuild_edge_capacity", test_nanogrid_rebuild_edge_capacity, devices=cuda_devices
+)
+add_function_test(
+    TestFemGeometry, "test_nanogrid_rebuild_auxiliary_status", test_nanogrid_rebuild_auxiliary_status, devices=devices
 )
 add_function_test(TestFemGeometry, "test_nanogrid_rebuild_capture", test_nanogrid_rebuild_capture, devices=cuda_devices)
 add_function_test(

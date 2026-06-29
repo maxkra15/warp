@@ -722,6 +722,8 @@ class Nanogrid(NanogridBase):
         self._topology_capture_locked = False
         self._node_candidates = node_candidates
         self._node_candidate_mask = node_candidate_mask
+        self._node_rebuild_status = wp.empty(1, dtype=wp.uint32, device=device) if rebuildable else None
+        self._edge_rebuild_status = wp.empty(1, dtype=wp.uint32, device=device) if rebuildable else None
 
         self._edge_count = 0
         self._edge_grid = None
@@ -794,20 +796,23 @@ class Nanogrid(NanogridBase):
         if packed_points is not None:
             packed_points.release()
 
-        self.rebuild_topology_from_cells()
+        self._refresh_rebuildable_topology(status=status, preserve_status=True)
         return status
 
-    def rebuild_topology_from_cells(self):
+    def rebuild_topology_from_cells(self, status: wp.array | None = None):
         """Refresh Nanogrid topology buffers from the current cell grid.
 
         During CUDA graph capture, use :meth:`rebuild` instead of rebuilding the underlying Volume separately when
         face state may exist, because only :meth:`rebuild` can preflight before Volume work is recorded.
+
+        Args:
+            status: Optional one-element ``uint32`` array receiving rebuild status flags from auxiliary topology.
         """
 
         if not self._rebuildable:
             raise RuntimeError("Nanogrid was not constructed in rebuildable mode")
 
-        self._refresh_rebuildable_topology()
+        self._refresh_rebuildable_topology(status=status, preserve_status=False)
 
     @property
     def edge_grid(self) -> wp.Volume:
@@ -1093,7 +1098,7 @@ class Nanogrid(NanogridBase):
                 raise RuntimeError("Rebuildable Nanogrid face topology cannot be refreshed during CUDA graph capture")
             self._topology_capture_locked = True
 
-    def _refresh_rebuildable_topology(self):
+    def _refresh_rebuildable_topology(self, status: wp.array | None = None, preserve_status: bool = False):
         self._preflight_rebuildable_topology_capture()
 
         self._cell_grid.get_voxels(out=self._cell_ijk)
@@ -1101,7 +1106,10 @@ class Nanogrid(NanogridBase):
         _fill_rebuildable_node_candidates(
             self._cell_grid, self._cell_ijk, self._node_candidates, self._node_candidate_mask
         )
-        self._node_grid.rebuild(self._node_candidates.flatten(), point_mask=self._node_candidate_mask)
+        node_status = self._node_rebuild_status if status is not None and preserve_status else status
+        self._node_grid.rebuild(
+            self._node_candidates.flatten(), status=node_status, point_mask=self._node_candidate_mask
+        )
         self._node_grid.get_voxels(out=self._node_ijk)
 
         self._face_grid = None
@@ -1116,7 +1124,25 @@ class Nanogrid(NanogridBase):
             _fill_rebuildable_edge_candidates(
                 self._cell_grid, self._cell_ijk, self._edge_candidates, self._edge_candidate_mask
             )
-            self._edge_grid.rebuild(self._edge_candidates.flatten(), point_mask=self._edge_candidate_mask)
+            self._edge_grid.rebuild(
+                self._edge_candidates.flatten(),
+                status=self._edge_rebuild_status if status is not None else None,
+                point_mask=self._edge_candidate_mask,
+            )
+
+        if status is not None:
+            wp.launch(
+                _aggregate_nanogrid_rebuild_status,
+                dim=1,
+                inputs=[
+                    status,
+                    node_status,
+                    self._edge_rebuild_status,
+                    int(self._edge_candidates is not None),
+                    int(preserve_status),
+                ],
+                device=self._cell_grid.device,
+            )
 
         self.cell_arg_value.invalidate(self)
         self.side_arg_value.invalidate(self)
@@ -1629,6 +1655,22 @@ def _fill_cell_env_from_world_points_masked(
 
 
 # -- Topology-building kernels (precision-independent) --
+
+
+@wp.kernel
+def _aggregate_nanogrid_rebuild_status(
+    status: wp.array(dtype=wp.uint32),
+    node_status: wp.array(dtype=wp.uint32),
+    edge_status: wp.array(dtype=wp.uint32),
+    include_edge: int,
+    preserve_status: int,
+):
+    value = node_status[0]
+    if include_edge != 0:
+        value = value | edge_status[0]
+    if preserve_status != 0:
+        value = value | status[0]
+    status[0] = value
 
 
 @wp.kernel
