@@ -4,9 +4,11 @@
 """Tests for APIC (API Capture) graph serialization and loading."""
 
 import ctypes
+import gc
 import os
 import tempfile
 import unittest
+import weakref
 
 import numpy as np
 
@@ -1638,6 +1640,87 @@ def test_borrow_temporary_not_recycled_during_apic_capture(test, device):
     test.assertEqual(t1.ptr, ptr1, "captured temporary was released mid-capture")
 
 
+def test_borrow_temporary_bypasses_pool_during_cuda_capture(test, device, apic=False):
+    """Native CUDA capture scratch remains external and graph-owned until graph destruction."""
+    from warp._src.fem import cache as fem_cache  # noqa: PLC0415
+
+    store = fem_cache.TemporaryStore()
+    source = wp.ones(64, dtype=wp.float32, device=device)
+    output = wp.zeros(64, dtype=wp.float32, device=device)
+    grad_output = wp.zeros(64, dtype=wp.float32, device=device)
+    pooled = fem_cache.borrow_temporary(store, shape=(64,), dtype=wp.float32, device=device)
+    pooled_ptr = pooled.ptr
+    pooled.release()
+
+    with wp.ScopedCapture(device=device, apic=apic, force_module_load=False) as capture:
+        captured = fem_cache.borrow_temporary(
+            store,
+            shape=(64,),
+            dtype=wp.float32,
+            device=device,
+            requires_grad=True,
+        )
+        captured_ptr = captured.ptr
+        wp.copy(dest=captured, src=source)
+        wp.copy(dest=output, src=captured)
+        wp.copy(dest=grad_output, src=captured.grad)
+        captured.release()
+
+    borrowed_after_capture = fem_cache.borrow_temporary(store, shape=(64,), dtype=wp.float32, device=device)
+    test.assertNotEqual(
+        borrowed_after_capture.ptr,
+        captured_ptr,
+        "captured temporary pointer was reissued by the recycling pool",
+    )
+    test.assertEqual(borrowed_after_capture.ptr, pooled_ptr)
+
+    for _ in range(2):
+        captured.fill_(7.0)
+        output.zero_()
+        captured.grad.fill_(7.0)
+        grad_output.fill_(-1.0)
+        wp.capture_launch(capture.graph)
+        np.testing.assert_array_equal(output.numpy(), np.ones(64, dtype=np.float32))
+        np.testing.assert_array_equal(grad_output.numpy(), np.zeros(64, dtype=np.float32))
+
+    if apic:
+        # Make the serialized graph prove that it replays initialization rather
+        # than inheriting the capture-time contents of its internal regions.
+        captured.fill_(9.0)
+        captured.grad.fill_(9.0)
+        output.fill_(-1.0)
+        grad_output.fill_(-1.0)
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = os.path.join(temp_dir, "capture_owned_temporary")
+            wp.capture_save(
+                capture.graph,
+                path,
+                inputs={"source": source},
+                outputs={"output": output, "grad_output": grad_output},
+            )
+            loaded = wp.capture_load(path, device=device)
+            wp.capture_launch(loaded)
+
+            loaded_output = wp.empty(64, dtype=wp.float32, device=device)
+            loaded_grad_output = wp.empty(64, dtype=wp.float32, device=device)
+            loaded.get_param("output", loaded_output)
+            loaded.get_param("grad_output", loaded_grad_output)
+            np.testing.assert_array_equal(loaded_output.numpy(), np.ones(64, dtype=np.float32))
+            np.testing.assert_array_equal(loaded_grad_output.numpy(), np.zeros(64, dtype=np.float32))
+
+    # release() during capture must be deferred while the graph retains this
+    # external allocation; otherwise later capture work or replay can refer to
+    # storage that has already been freed or recycled.
+    test.assertIsNotNone(captured.deleter)
+    capture_graph_ref = weakref.ref(capture.graph)
+    capture.graph = None
+    gc.collect()
+    test.assertIsNone(capture_graph_ref())
+
+    captured.release()
+    test.assertIsNone(captured.deleter)
+
+
 @wp.kernel
 def saxpy_kernel(a: wp.array(dtype=float), b: wp.array(dtype=float), s: float, out: wp.array(dtype=float)):
     i = wp.tid()
@@ -2263,6 +2346,19 @@ add_function_test(
     "test_borrow_temporary_not_recycled_during_apic_capture",
     test_borrow_temporary_not_recycled_during_apic_capture,
     devices=[d for d in devices if d.is_cpu],
+)
+add_function_test(
+    TestApic,
+    "test_borrow_temporary_bypasses_pool_during_cuda_capture",
+    test_borrow_temporary_bypasses_pool_during_cuda_capture,
+    devices=[d for d in devices_with_graph_capture_allocation if d.is_cuda],
+)
+add_function_test(
+    TestApic,
+    "test_borrow_temporary_bypasses_pool_during_cuda_apic_capture",
+    test_borrow_temporary_bypasses_pool_during_cuda_capture,
+    devices=[d for d in devices_with_graph_capture_allocation if d.is_cuda],
+    apic=True,
 )
 add_function_test(
     TestApic,

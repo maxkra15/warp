@@ -609,16 +609,22 @@ class TemporaryStore:
 
         from warp._src.context import runtime  # noqa: PLC0415
 
+        temporary = temporary_ref()
+        if temporary is None:
+            return
+
+        capture_graph_ref = getattr(temporary, "_capture_graph_ref", None)
+        if capture_graph_ref is not None and capture_graph_ref() is not None:
+            # The graph still references this externally allocated buffer.
+            # Its strong reference owns the array until graph destruction.
+            return
+
         if runtime.tape is not None or runtime._apic_capture is not None:
             # Prevent early release while a wp.Tape or an APIC graph capture is
             # recording: the captured byte stream references the buffer by
             # pointer, so it must stay alive (and unrecycled) until the graph is
             # destroyed. Rely on garbage collection plus the capture's _regions
             # retention instead.
-            return
-
-        temporary = temporary_ref()
-        if temporary is None:
             return
 
         if temporary.deleter is not None:
@@ -657,21 +663,49 @@ def borrow_temporary(
         device: device on which the memory should be allocated; if ``None``, the current device will be used.
     """
 
-    from warp._src.context import runtime  # noqa: PLC0415
+    from warp._src.context import (  # noqa: PLC0415
+        capture_external_allocation_scope,
+        get_active_capture_graph,
+    )
+
+    device = wp.get_device(device)
 
     if temporary_store is None:
         temporary_store = TemporaryStore._default_store
 
-    # During APIC graph capture, bypass the recycling pool. The captured byte
-    # stream references buffers by pointer, so a borrowed temporary must not be
-    # handed back to a later borrow. A non-pool array -- its own allocator
-    # deleter, never entered into Pool._allocs -- is never re-issued; track_array()
-    # retains it via the capture's _regions for the graph's lifetime, and
-    # release()/detach() are suppressed while a capture is active (see
-    # _release_temporary).
-    if temporary_store is None or runtime._apic_capture is not None:
+    capture_graph = get_active_capture_graph(device)
+    if capture_graph is not None:
+        # Keep native CUDA allocations out of the captured graph and retain all
+        # capture-owned temporaries until after graph destruction. APIC-only and
+        # cross-device allocations use the same ownership path without stream
+        # redirection.
+        with capture_external_allocation_scope(device, capture_graph) as redirected:
+            temporary = Temporary(
+                shape=shape,
+                dtype=dtype,
+                pinned=pinned,
+                device=device,
+                requires_grad=requires_grad,
+            )
+
+        temporary._capture_graph_ref = weakref.ref(capture_graph)
+        capture_graph._retain_capture_array(temporary)
+        if redirected and temporary.grad is not None:
+            # The constructor initialized the gradient on the allocation stream;
+            # record the usual initialization on the capturing stream as well so
+            # every replay starts with a zero gradient.
+            temporary.grad.zero_()
+        return TemporaryStore.add_temporary_convenience_methods(temporary)
+
+    if temporary_store is None:
         return TemporaryStore.add_temporary_convenience_methods(
-            Temporary(shape=shape, dtype=dtype, pinned=pinned, device=device, requires_grad=requires_grad)
+            Temporary(
+                shape=shape,
+                dtype=dtype,
+                pinned=pinned,
+                device=device,
+                requires_grad=requires_grad,
+            )
         )
 
     return temporary_store.borrow(shape=shape, dtype=dtype, device=device, pinned=pinned, requires_grad=requires_grad)

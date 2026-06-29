@@ -163,7 +163,7 @@ class EnvironmentSpacePartition(SpacePartition):
         self._space_to_partition: wp.array = None
         """Mapping from global space node indices to environment-major partition node indices."""
         self._env_offsets: wp.array | None = None
-        """Partition node offsets for each environment, or ``None`` if some nodes are environmentless."""
+        """Partition node offsets, or ``None`` for exact-count partitions with environmentless nodes."""
         self._node_count: int = 0
         """Number of nodes in the environment-major partition."""
 
@@ -179,18 +179,30 @@ class EnvironmentSpacePartition(SpacePartition):
         If the geometry or partition layout changes between rebuilds, for example
         if the geometry environment count changes, arrays returned by
         :meth:`space_node_indices` or :attr:`env_offsets` should be reacquired.
+        Changing the topology size, environment count, device, or capacity is a
+        structural operation and is not supported inside an existing graph
+        capture.
+
+        Fixed-capacity non-whole partitions use valid inactive topology indices
+        as filler. Those entries remain absent from the inverse map and are
+        covered by the final environment interval.
         """
         geometry = self.space_topology.geometry
         env_count = geometry.environment_count()
         space_node_count = self.space_topology.node_count()
         max_node_count = self._max_node_count
+        device = wp.get_device(device)
 
         if env_count <= 1 and isinstance(self.geo_partition, WholeGeometryPartition):
             partition_node_count = min(max_node_count, space_node_count) if max_node_count >= 0 else space_node_count
-            if self._node_indices is None or self._node_indices.shape[0] != partition_node_count:
+            if (
+                self._node_indices is None
+                or self._node_indices.shape[0] != partition_node_count
+                or self._node_indices.device != device
+            ):
                 if self._node_indices is not None:
                     if self._space_to_partition is self._node_indices:
-                        self._space_to_partition = None
+                        self._set_space_to_partition(None)
                     self._node_indices.release()
                 self._node_indices = cache.borrow_temporary(
                     temporary_store,
@@ -205,16 +217,28 @@ class EnvironmentSpacePartition(SpacePartition):
                 device=device,
             )
             self._node_count = partition_node_count
-            self._env_offsets = wp.array([0, partition_node_count], dtype=int, device=device)
+            if self._env_offsets is None or self._env_offsets.shape != (2,) or self._env_offsets.device != device:
+                self._set_env_offsets(
+                    cache.borrow_temporary(
+                        temporary_store,
+                        shape=(2,),
+                        dtype=int,
+                        device=device,
+                    )
+                )
+            wp.launch(
+                kernel=EnvironmentSpacePartition._fill_single_environment_offsets,
+                dim=2,
+                inputs=[partition_node_count, self._env_offsets],
+                device=device,
+            )
 
             if partition_node_count == space_node_count:
                 if self._space_to_partition is not None and self._space_to_partition is not self._node_indices:
                     self._space_to_partition.release()
-                self._space_to_partition = self._node_indices
+                self._set_space_to_partition(self._node_indices)
             else:
-                self._space_to_partition = self._make_space_to_partition(
-                    space_node_count, temporary_store, device, partition_node_count
-                )
+                self._make_space_to_partition(space_node_count, temporary_store, device, partition_node_count)
             return
 
         include_environmentless = isinstance(self.geo_partition, WholeGeometryPartition)
@@ -288,6 +312,72 @@ class EnvironmentSpacePartition(SpacePartition):
         group_offsets, node_indices = compress_node_indices(env_count + 1, node_env, temporary_store=temporary_store)
         device = node_env.device
 
+        if max_node_count >= 0:
+            if (
+                self._node_indices is None
+                or self._node_indices.shape[0] != max_node_count
+                or self._node_indices.device != device
+            ):
+                if self._node_indices is not None:
+                    if self._space_to_partition is self._node_indices:
+                        self._set_space_to_partition(None)
+                    self._node_indices.release()
+                self._node_indices = cache.borrow_temporary(
+                    temporary_store,
+                    shape=(max_node_count,),
+                    dtype=int,
+                    device=device,
+                )
+            if max_node_count > 0:
+                # Compression orders active environment nodes first and then
+                # environmentless nodes. Copy the latter as bounds-safe filler
+                # for unused capacity; the capped scatter below deliberately
+                # leaves their inverse-map entries at NULL_NODE_INDEX.
+                wp.copy(dest=self._node_indices, src=node_indices, count=max_node_count)
+
+            space_to_partition = self._ensure_space_to_partition(space_node_count, temporary_store, device)
+            space_to_partition.fill_(NULL_NODE_INDEX)
+            if max_node_count > 0:
+                wp.launch(
+                    kernel=EnvironmentSpacePartition._scatter_capped_partition_indices,
+                    dim=max_node_count,
+                    inputs=[
+                        int(include_environmentless),
+                        env_count,
+                        group_offsets,
+                        self._node_indices,
+                        space_to_partition,
+                    ],
+                    device=device,
+                )
+
+            if (
+                self._env_offsets is None
+                or self._env_offsets.shape != (env_count + 1,)
+                or self._env_offsets.device != device
+            ):
+                self._set_env_offsets(
+                    cache.borrow_temporary(
+                        temporary_store,
+                        shape=(env_count + 1,),
+                        dtype=int,
+                        device=device,
+                    )
+                )
+            wp.launch(
+                kernel=EnvironmentSpacePartition._fill_capped_environment_offsets,
+                dim=env_count + 1,
+                inputs=[max_node_count, env_count, group_offsets, self._env_offsets],
+                device=device,
+            )
+
+            self._node_count = max_node_count
+
+            node_env.release()
+            node_indices.release()
+            group_offsets.release()
+            return
+
         group_offsets_np = group_offsets.numpy()
         env_node_count = int(group_offsets_np[env_count])
         full_partition_node_count = space_node_count if include_environmentless else env_node_count
@@ -295,7 +385,11 @@ class EnvironmentSpacePartition(SpacePartition):
             min(max_node_count, full_partition_node_count) if max_node_count >= 0 else full_partition_node_count
         )
 
-        if self._node_indices is None or self._node_indices.shape[0] != partition_node_count:
+        if (
+            self._node_indices is None
+            or self._node_indices.shape[0] != partition_node_count
+            or self._node_indices.device != device
+        ):
             if self._node_indices is not None:
                 if self._space_to_partition is self._node_indices:
                     self._space_to_partition = None
@@ -305,19 +399,19 @@ class EnvironmentSpacePartition(SpacePartition):
             )
         wp.copy(dest=self._node_indices, src=node_indices, count=partition_node_count)
 
-        self._space_to_partition = self._make_space_to_partition(
-            space_node_count, temporary_store, device, partition_node_count
-        )
+        self._make_space_to_partition(space_node_count, temporary_store, device, partition_node_count)
 
         self._node_count = partition_node_count
         if partition_node_count <= env_node_count:
-            self._env_offsets = wp.array(
-                np.minimum(group_offsets_np[: env_count + 1], partition_node_count),
-                dtype=int,
-                device=device,
+            self._set_env_offsets(
+                wp.array(
+                    np.minimum(group_offsets_np[: env_count + 1], partition_node_count),
+                    dtype=int,
+                    device=device,
+                )
             )
         else:
-            self._env_offsets = None
+            self._set_env_offsets(None)
 
         node_env.release()
         node_indices.release()
@@ -342,8 +436,20 @@ class EnvironmentSpacePartition(SpacePartition):
         These offsets count partition nodes, not scalar coefficients. For scalar-valued fields,
         they may be used directly as ``LinearOperator`` batch offsets; for fields with multiple
         scalar coefficients per node, callers must convert them to coefficient offsets first.
+        For fixed-capacity partitions the final offset is the capacity, so the
+        last environment interval also covers any inactive filler entries.
         """
         return self._env_offsets
+
+    def _set_env_offsets(self, env_offsets: wp.array | None):
+        if self._env_offsets is env_offsets:
+            return
+
+        if self._env_offsets is not None:
+            release = getattr(self._env_offsets, "release", None)
+            if release is not None:
+                release()
+        self._env_offsets = env_offsets
 
     def _make_space_to_partition(
         self,
@@ -352,18 +458,7 @@ class EnvironmentSpacePartition(SpacePartition):
         device,
         partition_node_count: int,
     ):
-        if self._space_to_partition is self._node_indices:
-            space_to_partition = None
-        else:
-            space_to_partition = self._space_to_partition
-
-        if space_to_partition is None or space_to_partition.shape[0] != space_node_count:
-            if space_to_partition is not None:
-                space_to_partition.release()
-            space_to_partition = cache.borrow_temporary(
-                temporary_store, shape=(space_node_count,), dtype=int, device=device
-            )
-
+        space_to_partition = self._ensure_space_to_partition(space_node_count, temporary_store, device)
         space_to_partition.fill_(NULL_NODE_INDEX)
         wp.launch(
             kernel=EnvironmentSpacePartition._scatter_partition_indices,
@@ -373,6 +468,36 @@ class EnvironmentSpacePartition(SpacePartition):
         )
 
         return space_to_partition
+
+    def _ensure_space_to_partition(
+        self,
+        space_node_count: int,
+        temporary_store: cache.TemporaryStore | None,
+        device,
+    ):
+        if self._space_to_partition is self._node_indices:
+            space_to_partition = None
+        else:
+            space_to_partition = self._space_to_partition
+
+        if (
+            space_to_partition is None
+            or space_to_partition.shape[0] != space_node_count
+            or space_to_partition.device != device
+        ):
+            if space_to_partition is not None:
+                space_to_partition.release()
+            space_to_partition = cache.borrow_temporary(
+                temporary_store, shape=(space_node_count,), dtype=int, device=device
+            )
+
+        self._set_space_to_partition(space_to_partition)
+        return space_to_partition
+
+    def _set_space_to_partition(self, space_to_partition: wp.array | None):
+        if self._space_to_partition is not space_to_partition:
+            self._space_to_partition = space_to_partition
+            self.partition_arg_value.invalidate(self)
 
     def fill_partition_arg(self, arg, device):
         arg.space_to_partition = self._space_to_partition.to(device)
@@ -392,6 +517,43 @@ class EnvironmentSpacePartition(SpacePartition):
     ):
         partition_idx = wp.tid()
         space_to_partition[partition_to_space[partition_idx]] = partition_idx
+
+    @wp.kernel
+    def _scatter_capped_partition_indices(
+        include_environmentless: int,
+        env_count: int,
+        group_offsets: wp.array(dtype=int),
+        partition_to_space: wp.array(dtype=int),
+        space_to_partition: wp.array(dtype=int),
+    ):
+        partition_idx = wp.tid()
+        valid_node_count = partition_to_space.shape[0]
+        if include_environmentless == 0:
+            valid_node_count = wp.min(group_offsets[env_count], valid_node_count)
+
+        if partition_idx < valid_node_count:
+            space_to_partition[partition_to_space[partition_idx]] = partition_idx
+
+    @wp.kernel
+    def _fill_capped_environment_offsets(
+        max_node_count: int,
+        env_count: int,
+        group_offsets: wp.array(dtype=int),
+        env_offsets: wp.array(dtype=int),
+    ):
+        env_index = wp.tid()
+        if env_index == env_count:
+            env_offsets[env_index] = max_node_count
+        else:
+            env_offsets[env_index] = wp.min(group_offsets[env_index], max_node_count)
+
+    @wp.kernel
+    def _fill_single_environment_offsets(
+        node_count: int,
+        env_offsets: wp.array(dtype=int),
+    ):
+        env_index = wp.tid()
+        env_offsets[env_index] = env_index * node_count
 
 
 class NodeCategory:
@@ -721,7 +883,10 @@ def make_space_partition(
           Halo nodes are not currently supported with ``environment_first``.
         environment_first: If True, order partition nodes by environment to make sure node indices are
           contiguous within each environment.
-        max_node_count: if positive, will be used to limit the number of nodes to avoid device/host synchronization.
+        max_node_count: If nonnegative, use this fixed node capacity to avoid device/host synchronization. For an
+          environment-first partition, active nodes form an environment-major prefix, inactive capacity is covered by
+          the final environment interval, and, for non-whole geometry partitions, nodes beyond the active prefix remain
+          absent from the inverse mapping.
         device: Warp device on which to perform and store computations
 
     Returns:

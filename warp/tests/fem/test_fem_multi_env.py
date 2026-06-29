@@ -9,6 +9,7 @@ import numpy as np
 
 import warp as wp
 import warp.fem as fem
+from warp.tests.fem.utils import linear_form
 from warp.tests.unittest_utils import *
 
 
@@ -169,19 +170,6 @@ def _assert_multi_env_node_isolation(test, geo: fem.Geometry, space: fem.Functio
         test.assertTrue(np.all(nodes < (env_index + 1) * base_node_count))
 
 
-def _assert_graph_allocations_balanced(test, graph):
-    with tempfile.TemporaryDirectory() as temp_dir:
-        dot_path = f"{temp_dir}/graph.dot"
-        wp.capture_debug_dot_print(graph, dot_path, verbose=True)
-        with open(dot_path, encoding="utf-8") as dot_file:
-            dot = dot_file.read().lower()
-    test.assertEqual(
-        dot.count("mem_alloc"),
-        dot.count("mem_free"),
-        "captured graph contains persistent allocations without matching frees",
-    )
-
-
 def _assert_sparse_multi_env_node_isolation(test, geo: fem.Geometry, space: fem.FunctionSpace, cell_env, device):
     with wp.ScopedDevice(device):
         cell_env_np = cell_env.numpy()
@@ -238,6 +226,530 @@ def _assert_environment_first_pressure_partition(test, geo: fem.Geometry, cell_e
     for env_index in range(geo.environment_count()):
         env_node_indices = node_indices[offsets_np[env_index] : offsets_np[env_index + 1]]
         np.testing.assert_array_equal(cell_env_np[env_node_indices], np.full(env_node_indices.shape, env_index))
+
+
+def _make_capped_environment_partition(device, cell_mask, capacity):
+    geo = fem.Grid2D(res=wp.vec2i(2, 1), env_count=3)
+    mask = wp.array(cell_mask, dtype=int, device=device)
+    geo_partition = fem.ExplicitGeometryPartition(
+        geo,
+        mask,
+        max_cell_count=4,
+        max_side_count=0,
+    )
+    space = fem.make_polynomial_space(geo, degree=0, discontinuous=True)
+    space_partition = fem.make_space_partition(
+        space_topology=space.topology,
+        geometry_partition=geo_partition,
+        environment_first=True,
+        with_halo=False,
+        max_node_count=capacity,
+        device=device,
+    )
+    return mask, geo_partition, space_partition
+
+
+def _assert_capped_environment_partition(
+    test,
+    partition,
+    capacity,
+    active_nodes,
+    env_offsets,
+    node_indices=None,
+):
+    test.assertEqual(partition.node_count(), capacity)
+    test.assertEqual(partition.owned_node_count(), capacity)
+    test.assertEqual(partition.interior_node_count(), capacity)
+
+    actual_node_indices = partition.space_node_indices().numpy()
+    test.assertEqual(actual_node_indices.shape, (capacity,))
+    if node_indices is None:
+        np.testing.assert_array_equal(
+            actual_node_indices[: len(active_nodes)],
+            np.array(active_nodes, dtype=np.int32),
+        )
+    else:
+        np.testing.assert_array_equal(actual_node_indices, np.array(node_indices, dtype=np.int32))
+
+    expected_inverse = np.full(partition.space_topology.node_count(), fem.NULL_NODE_INDEX, dtype=np.int32)
+    for partition_index, space_index in enumerate(active_nodes):
+        expected_inverse[space_index] = partition_index
+    np.testing.assert_array_equal(partition._space_to_partition.numpy(), expected_inverse)
+
+    offsets = partition.env_offsets.numpy()
+    test.assertEqual(offsets.shape, (partition.space_topology.geometry.environment_count() + 1,))
+    np.testing.assert_array_equal(offsets, np.array(env_offsets, dtype=np.int32))
+    test.assertTrue(np.all(offsets[:-1] <= offsets[1:]))
+    test.assertEqual(offsets[-1], capacity)
+
+
+def _assert_graph_allocations_balanced(test, graph):
+    with tempfile.TemporaryDirectory() as temp_dir:
+        dot_path = f"{temp_dir}/graph.dot"
+        wp.capture_debug_dot_print(graph, dot_path, verbose=True)
+        with open(dot_path, encoding="utf-8") as dot_file:
+            dot = dot_file.read().lower()
+    test.assertEqual(
+        dot.count("mem_alloc"),
+        dot.count("mem_free"),
+        "captured graph contains persistent allocations without matching frees",
+    )
+
+
+def test_environment_space_partition_fixed_capacity(test, device):
+    with wp.ScopedDevice(device):
+        _, _, underfilled = _make_capped_environment_partition(
+            device,
+            cell_mask=[1, 1, 0, 0, 1, 0],
+            capacity=5,
+        )
+        _assert_capped_environment_partition(
+            test,
+            underfilled,
+            capacity=5,
+            active_nodes=[0, 1, 4],
+            env_offsets=[0, 2, 2, 5],
+            node_indices=[0, 1, 4, 2, 3],
+        )
+
+        # The final batch deliberately consumes fixed-capacity filler entries;
+        # this is the contract used by batched linear solvers.
+        from warp.optim.linear import aslinearoperator, cg  # noqa: PLC0415
+
+        rhs = wp.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=wp.float32, device=device)
+        solution = wp.zeros_like(rhs)
+        identity = aslinearoperator(
+            wp.ones_like(rhs),
+            batch_offsets=underfilled.env_offsets,
+        )
+        cg(
+            identity,
+            rhs,
+            solution,
+            tol=1.0e-7,
+            maxiter=2,
+            check_every=1,
+            use_cuda_graph=False,
+        )
+        np.testing.assert_allclose(solution.numpy(), rhs.numpy(), rtol=1.0e-6, atol=1.0e-6)
+
+        _, _, all_inactive = _make_capped_environment_partition(
+            device,
+            cell_mask=[0, 0, 0, 0, 0, 0],
+            capacity=5,
+        )
+        _assert_capped_environment_partition(
+            test,
+            all_inactive,
+            capacity=5,
+            active_nodes=[],
+            env_offsets=[0, 0, 0, 5],
+            node_indices=[0, 1, 2, 3, 4],
+        )
+
+        _, _, overflowed = _make_capped_environment_partition(
+            device,
+            cell_mask=[1, 1, 1, 0, 1, 0],
+            capacity=2,
+        )
+        _assert_capped_environment_partition(
+            test,
+            overflowed,
+            capacity=2,
+            active_nodes=[0, 1],
+            env_offsets=[0, 2, 2, 2],
+        )
+
+        _, _, empty = _make_capped_environment_partition(
+            device,
+            cell_mask=[1, 0, 0, 0, 0, 0],
+            capacity=0,
+        )
+        _assert_capped_environment_partition(
+            test,
+            empty,
+            capacity=0,
+            active_nodes=[],
+            env_offsets=[0, 0, 0, 0],
+        )
+
+        single_geo = fem.Grid2D(res=wp.vec2i(2, 1))
+        single_space = fem.make_polynomial_space(single_geo, degree=0, discontinuous=True)
+        single_partition = fem.make_space_partition(
+            space_topology=single_space.topology,
+            environment_first=True,
+            max_node_count=1,
+            device=device,
+        )
+        single_arrays = (
+            single_partition.space_node_indices(),
+            single_partition._space_to_partition,
+            single_partition.env_offsets,
+        )
+        single_partition.rebuild(device=device)
+        test.assertIs(single_partition.space_node_indices(), single_arrays[0])
+        test.assertIs(single_partition._space_to_partition, single_arrays[1])
+        test.assertIs(single_partition.env_offsets, single_arrays[2])
+        np.testing.assert_array_equal(single_partition.env_offsets.numpy(), np.array([0, 1], dtype=np.int32))
+
+        single_full = fem.make_space_partition(
+            space_topology=single_space.topology,
+            environment_first=True,
+            max_node_count=single_space.node_count(),
+            device=device,
+        )
+        test.assertIs(single_full._space_to_partition, single_full.space_node_indices())
+        full_arrays = (
+            single_full.space_node_indices(),
+            single_full.env_offsets,
+        )
+        full_arg = single_full.partition_arg_value(device)
+        test.assertIs(full_arg.space_to_partition, full_arrays[0])
+
+        single_full.rebuild(device=device)
+        test.assertIs(single_full.space_node_indices(), full_arrays[0])
+        test.assertIs(single_full._space_to_partition, full_arrays[0])
+        test.assertIs(single_full.env_offsets, full_arrays[1])
+        test.assertIs(single_full.partition_arg_value(device), full_arg)
+
+        # Exercise the structural alias-to-separate transition without changing
+        # the topology: the inverse map must be replaced and its cached device
+        # argument invalidated when the fixed capacity becomes partial.
+        single_full._max_node_count = single_space.node_count() - 1
+        single_full.rebuild(device=device)
+        test.assertIsNot(single_full._space_to_partition, single_full.space_node_indices())
+        partial_arg = single_full.partition_arg_value(device)
+        test.assertIsNot(partial_arg, full_arg)
+        test.assertIs(partial_arg.space_to_partition, single_full._space_to_partition)
+        np.testing.assert_array_equal(
+            single_full._space_to_partition.numpy(),
+            np.array([0, fem.NULL_NODE_INDEX], dtype=np.int32),
+        )
+
+        single_empty = fem.make_space_partition(
+            space_topology=single_space.topology,
+            environment_first=True,
+            max_node_count=0,
+            device=device,
+        )
+        test.assertEqual(single_empty.node_count(), 0)
+        np.testing.assert_array_equal(single_empty.env_offsets.numpy(), np.array([0, 0], dtype=np.int32))
+        np.testing.assert_array_equal(
+            single_empty._space_to_partition.numpy(),
+            np.full(single_space.node_count(), fem.NULL_NODE_INDEX, dtype=np.int32),
+        )
+
+        mesh_positions = wp.array(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [2.0, 2.0, 0.0],
+            ],
+            dtype=wp.vec3,
+            device=device,
+        )
+        mesh = fem.Trimesh3D(
+            wp.array([[0, 1, 2], [3, 4, 5]], dtype=int, device=device),
+            mesh_positions,
+            build_bvh=True,
+            cell_env=wp.array([0, 1], dtype=int, device=device),
+            env_count=2,
+        )
+        mesh_space = fem.make_polynomial_space(mesh, degree=1)
+        exact_whole = fem.make_space_partition(
+            space_topology=mesh_space.topology,
+            environment_first=True,
+            device=device,
+        )
+        test.assertIsNone(exact_whole.env_offsets)
+
+        capped_whole = fem.make_space_partition(
+            space_topology=mesh_space.topology,
+            environment_first=True,
+            max_node_count=mesh_space.node_count() + 1,
+            device=device,
+        )
+        test.assertEqual(capped_whole.node_count(), mesh_space.node_count())
+        np.testing.assert_array_equal(capped_whole.env_offsets.numpy(), np.array([0, 3, 7], dtype=np.int32))
+        np.testing.assert_array_equal(
+            capped_whole._space_to_partition.numpy(),
+            np.arange(mesh_space.node_count(), dtype=np.int32),
+        )
+
+
+def test_environment_space_partition_capture(test, device):
+    with wp.ScopedDevice(device):
+        temporary_store = fem.TemporaryStore()
+        cell_mask, geo_partition, space_partition = _make_capped_environment_partition(
+            device,
+            cell_mask=[1, 0, 0, 1, 0, 0],
+            capacity=5,
+        )
+
+        node_indices = space_partition.space_node_indices()
+        space_to_partition = space_partition._space_to_partition
+        env_offsets = space_partition.env_offsets
+        array_ptrs = (node_indices.ptr, space_to_partition.ptr, env_offsets.ptr)
+
+        with wp.ScopedCapture(device=device, force_module_load=False) as capture:
+            geo_partition.rebuild(cell_mask, temporary_store=temporary_store)
+            space_partition.rebuild(device=device, temporary_store=temporary_store)
+
+        test.assertIs(space_partition.space_node_indices(), node_indices)
+        test.assertIs(space_partition._space_to_partition, space_to_partition)
+        test.assertIs(space_partition.env_offsets, env_offsets)
+        test.assertEqual(
+            (node_indices.ptr, space_to_partition.ptr, env_offsets.ptr),
+            array_ptrs,
+        )
+
+        for mask, active_nodes, offsets in (
+            ([1, 0, 0, 1, 0, 0], [0, 3], [0, 1, 2, 5]),
+            ([1, 1, 0, 0, 1, 0], [0, 1, 4], [0, 2, 2, 5]),
+        ):
+            cell_mask.assign(mask)
+            wp.capture_launch(capture.graph)
+            _assert_capped_environment_partition(
+                test,
+                space_partition,
+                capacity=5,
+                active_nodes=active_nodes,
+                env_offsets=offsets,
+            )
+            test.assertIs(space_partition.space_node_indices(), node_indices)
+            test.assertIs(space_partition._space_to_partition, space_to_partition)
+            test.assertIs(space_partition.env_offsets, env_offsets)
+            test.assertEqual(
+                (node_indices.ptr, space_to_partition.ptr, env_offsets.ptr),
+                array_ptrs,
+            )
+
+
+def test_environment_space_partition_releases_replaced_offsets(test, device):
+    source_device = wp.get_device("cpu")
+    temporary_store = fem.TemporaryStore()
+    with wp.ScopedDevice(source_device):
+        geo = fem.Grid2D(res=wp.vec2i(2, 1))
+        space = fem.make_polynomial_space(geo, degree=0, discontinuous=True)
+        partition = fem.make_space_partition(
+            space_topology=space.topology,
+            environment_first=True,
+            max_node_count=space.node_count(),
+            device=source_device,
+            temporary_store=temporary_store,
+        )
+        old_offsets = partition.env_offsets
+        test.assertIsNotNone(old_offsets.deleter)
+
+    partition.rebuild(device=device, temporary_store=temporary_store)
+
+    test.assertIsNone(old_offsets.deleter)
+    test.assertEqual(partition.env_offsets.device, device)
+    np.testing.assert_array_equal(
+        partition.env_offsets.numpy(),
+        np.array([0, space.node_count()], dtype=np.int32),
+    )
+
+
+def test_environment_space_partition_capture_integration(test, device):
+    with wp.ScopedDevice(device):
+        temporary_store = fem.TemporaryStore()
+        initial_mask = [1, 0, 0, 1, 0, 0]
+        target_mask = [1, 1, 0, 0, 1, 0]
+        cell_mask, geo_partition, space_partition = _make_capped_environment_partition(
+            device,
+            cell_mask=initial_mask,
+            capacity=5,
+        )
+        space = fem.make_polynomial_space(geo_partition.geometry, degree=0, discontinuous=True)
+        test_field = fem.make_test(
+            space,
+            space_partition=space_partition,
+            domain=fem.Cells(geo_partition),
+            device=device,
+        )
+        output = wp.zeros(space_partition.node_count(), dtype=wp.float32, device=device)
+
+        def rebuild_and_integrate():
+            geo_partition.rebuild(cell_mask, temporary_store=temporary_store)
+            space_partition.rebuild(device=device, temporary_store=temporary_store)
+            test_field.space_restriction.rebuild(device=device, temporary_store=temporary_store)
+            output.zero_()
+            fem.integrate(
+                linear_form,
+                fields={"u": test_field},
+                assembly="generic",
+                output=output,
+                device=device,
+                temporary_store=temporary_store,
+                kernel_options={"enable_backward": False},
+            )
+
+        cell_mask.assign(target_mask)
+        rebuild_and_integrate()
+        expected = np.array([0.5, 0.5, 0.5, 0.0, 0.0], dtype=np.float32)
+        np.testing.assert_allclose(output.numpy(), expected, rtol=0.0, atol=1.0e-6)
+
+        cell_mask.assign(initial_mask)
+        rebuild_and_integrate()
+        with wp.ScopedCapture(device=device, force_module_load=False) as capture:
+            rebuild_and_integrate()
+
+        output.fill_(-1.0)
+        cell_mask.assign(target_mask)
+        wp.capture_launch(capture.graph)
+
+        np.testing.assert_allclose(output.numpy(), expected, rtol=0.0, atol=1.0e-6)
+        _assert_capped_environment_partition(
+            test,
+            space_partition,
+            capacity=5,
+            active_nodes=[0, 1, 4],
+            env_offsets=[0, 2, 2, 5],
+            node_indices=[0, 1, 4, 2, 3],
+        )
+
+
+def test_environment_space_partition_capture_temporary_reuse(test, device):
+    from warp._src.fem import cache as fem_cache  # noqa: PLC0415
+
+    with wp.ScopedDevice(device):
+        temporary_store = fem.TemporaryStore()
+        cell_mask, geo_partition, space_partition = _make_capped_environment_partition(
+            device,
+            cell_mask=[1, 0, 0, 1, 0, 0],
+            capacity=5,
+        )
+
+        # Seed the public pool with enough int buffers to cover every scratch
+        # size used by the geometry and space rebuilds. On the buggy path, the
+        # capture borrows and returns these same buffers; after the capture we
+        # can then borrow and overwrite graph-referenced memory. A capture-safe
+        # implementation leaves this pool entirely independent from the graph.
+        scratch_shapes = sorted(
+            {
+                1,
+                geo_partition.geometry.environment_count() + 2,
+                space_partition.space_topology.node_count(),
+                2 * space_partition.space_topology.node_count(),
+                geo_partition.geometry.side_count(),
+            }
+        )
+        seeded_temporaries = [
+            fem_cache.borrow_temporary(temporary_store, shape=shape, dtype=int, device=device)
+            for shape in scratch_shapes
+            for _ in range(16)
+        ]
+        for temporary in seeded_temporaries:
+            temporary.release()
+
+        with wp.ScopedCapture(device=device, force_module_load=False) as capture:
+            geo_partition.rebuild(cell_mask, temporary_store=temporary_store)
+            space_partition.rebuild(device=device, temporary_store=temporary_store)
+
+        poisoned_temporaries = [
+            fem_cache.borrow_temporary(temporary_store, shape=shape, dtype=int, device=device)
+            for shape in scratch_shapes
+            for _ in range(16)
+        ]
+        for temporary in poisoned_temporaries:
+            # Zero is deliberately bounds-safe even when the captured graph
+            # interprets the aliased storage as offsets or sort indices.
+            temporary.zero_()
+
+        cell_mask.assign([1, 1, 0, 0, 1, 0])
+        wp.capture_launch(capture.graph)
+        mutated_temporaries = [
+            index for index, temporary in enumerate(poisoned_temporaries) if np.any(temporary.numpy() != 0)
+        ]
+        test.assertEqual(
+            mutated_temporaries,
+            [],
+            "captured graph wrote through a temporary re-borrowed after capture",
+        )
+        _assert_capped_environment_partition(
+            test,
+            space_partition,
+            capacity=5,
+            active_nodes=[0, 1, 4],
+            env_offsets=[0, 2, 2, 5],
+            node_indices=[0, 1, 4, 2, 3],
+        )
+
+
+def test_environment_space_partition_capture_construction_replay(test, device):
+    with wp.ScopedDevice(device):
+        geo = fem.Grid2D(res=wp.vec2i(2, 1), env_count=3)
+        cell_mask = wp.array([1, 1, 0, 0, 1, 0], dtype=int, device=device)
+        geo_partition = fem.ExplicitGeometryPartition(
+            geo,
+            cell_mask,
+            max_cell_count=4,
+            max_side_count=0,
+        )
+        space = fem.make_polynomial_space(geo, degree=0, discontinuous=True)
+
+        # Preload every module used by construction before entering capture.
+        fem.make_space_partition(
+            space_topology=space.topology,
+            geometry_partition=geo_partition,
+            environment_first=True,
+            with_halo=False,
+            max_node_count=5,
+            device=device,
+        )
+
+        temporary_store = fem.TemporaryStore()
+        with wp.ScopedCapture(device=device, force_module_load=False) as capture:
+            partition = fem.make_space_partition(
+                space_topology=space.topology,
+                geometry_partition=geo_partition,
+                environment_first=True,
+                with_halo=False,
+                max_node_count=5,
+                device=device,
+                temporary_store=temporary_store,
+            )
+
+        _assert_graph_allocations_balanced(test, capture.graph)
+        for _ in range(2):
+            wp.capture_launch(capture.graph)
+            _assert_capped_environment_partition(
+                test,
+                partition,
+                capacity=5,
+                active_nodes=[0, 1, 4],
+                env_offsets=[0, 2, 2, 5],
+                node_indices=[0, 1, 4, 2, 3],
+            )
+
+
+def test_environment_space_partition_uncapped_device_migration(test, device):
+    source_device = wp.get_device("cpu")
+    with wp.ScopedDevice(source_device):
+        geo = fem.Grid2D(res=wp.vec2i(2, 1), env_count=2)
+        space = fem.make_polynomial_space(geo, degree=0, discontinuous=True)
+        partition = fem.make_space_partition(
+            space_topology=space.topology,
+            environment_first=True,
+            device=source_device,
+        )
+        old_node_indices = partition.space_node_indices()
+
+    partition.rebuild(device=device)
+
+    test.assertIsNot(partition.space_node_indices(), old_node_indices)
+    test.assertIsNone(old_node_indices.deleter)
+    test.assertEqual(partition.space_node_indices().device, device)
+    test.assertEqual(partition.partition_arg_value(device).space_to_partition.device, device)
+    np.testing.assert_array_equal(
+        partition.space_node_indices().numpy(),
+        np.arange(space.node_count(), dtype=np.int32),
+    )
 
 
 def _make_env_offsets(offsets, device):
@@ -1364,6 +1876,48 @@ add_function_test(
 )
 add_function_test(
     TestFemMultiEnv, "test_adaptive_nanogrid_multi_env", test_adaptive_nanogrid_multi_env, devices=cuda_devices
+)
+add_function_test(
+    TestFemMultiEnv,
+    "test_environment_space_partition_fixed_capacity",
+    test_environment_space_partition_fixed_capacity,
+    devices=devices,
+)
+add_function_test(
+    TestFemMultiEnv,
+    "test_environment_space_partition_capture",
+    test_environment_space_partition_capture,
+    devices=capture_devices,
+)
+add_function_test(
+    TestFemMultiEnv,
+    "test_environment_space_partition_releases_replaced_offsets",
+    test_environment_space_partition_releases_replaced_offsets,
+    devices=cuda_devices[:1],
+)
+add_function_test(
+    TestFemMultiEnv,
+    "test_environment_space_partition_capture_integration",
+    test_environment_space_partition_capture_integration,
+    devices=capture_devices,
+)
+add_function_test(
+    TestFemMultiEnv,
+    "test_environment_space_partition_capture_temporary_reuse",
+    test_environment_space_partition_capture_temporary_reuse,
+    devices=capture_devices,
+)
+add_function_test(
+    TestFemMultiEnv,
+    "test_environment_space_partition_capture_construction_replay",
+    test_environment_space_partition_capture_construction_replay,
+    devices=capture_devices,
+)
+add_function_test(
+    TestFemMultiEnv,
+    "test_environment_space_partition_uncapped_device_migration",
+    test_environment_space_partition_uncapped_device_migration,
+    devices=cuda_devices[:1],
 )
 
 if __name__ == "__main__":

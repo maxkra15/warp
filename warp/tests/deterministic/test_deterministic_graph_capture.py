@@ -103,6 +103,39 @@ def test_graph_capture_deterministic_launch(test, device):
     np.testing.assert_array_equal(first, second)
 
 
+def test_graph_capture_deterministic_explicit_stream(test, device):
+    """Capture-safe deterministic allocation follows a non-current explicit stream."""
+    n = 256
+    rng = np.random.default_rng(30)
+    data = wp.array(rng.random(n, dtype=np.float32), dtype=wp.float32, device=device)
+    indices = wp.array(rng.integers(0, 8, size=n, dtype=np.int32), dtype=wp.int32, device=device)
+    output = wp.zeros(8, dtype=wp.float32, device=device)
+    capture_stream = wp.Stream(device)
+    test.assertIsNot(capture_stream, device.stream)
+
+    _load_capture_modules(device, scatter_add_kernel)
+    wp.launch(scatter_add_kernel, dim=n, inputs=[data, indices], outputs=[output], device=device)
+    output.zero_()
+
+    with wp.ScopedCapture(stream=capture_stream, force_module_load=False) as capture:
+        wp.launch(
+            scatter_add_kernel,
+            dim=n,
+            inputs=[data, indices],
+            outputs=[output],
+            stream=capture_stream,
+        )
+
+    wp.capture_launch(capture.graph, stream=capture_stream)
+    first = output.numpy().copy()
+
+    output.zero_()
+    wp.capture_launch(capture.graph, stream=capture_stream)
+    second = output.numpy().copy()
+
+    np.testing.assert_array_equal(first, second)
+
+
 def test_graph_capture_sliced_array(test, device):
     """Verify deterministic sliced-array atomics can be captured and replayed."""
     # The graph suite enables run-to-run deterministic mode for the module that
@@ -441,6 +474,7 @@ def _add(name, devices=cuda_devices):
 for _name in (
     "test_record_cmd_deterministic_launch",
     "test_graph_capture_deterministic_launch",
+    "test_graph_capture_deterministic_explicit_stream",
     "test_graph_capture_sliced_array",
     "test_graph_capture_deterministic_closure_kernel",
     "test_graph_capture_deterministic_func_kernel",
