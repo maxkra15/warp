@@ -966,6 +966,91 @@ def test_nanogrid_multi_env_rebuild_updates_automatic_offsets(test, device):
     test.assertEqual(sorted(geo.cell_env.numpy()[:live_cell_count].tolist()), [0, 0, 1])
 
 
+def test_nanogrid_multi_env_rebuild_capture_updates_automatic_offsets(test, device):
+    points = wp.array([[0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=wp.vec3f, device=device)
+    point_envs = wp.array([0, 0, 1], dtype=wp.int32, device=device)
+    point_mask = wp.array([1, 0, 1], dtype=wp.int32, device=device)
+    status = wp.zeros(1, dtype=wp.uint32, device=device)
+    geo = fem.Nanogrid.from_environment_voxels(
+        points,
+        point_envs,
+        3,
+        point_mask=point_mask,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=4,
+        max_leaf_nodes=4,
+        max_lower_nodes=4,
+        max_upper_nodes=4,
+        status=status,
+    )
+    env_offsets = geo.env_offsets
+    env_offsets_ptr = env_offsets.ptr
+    initial_offsets = env_offsets.numpy().copy()
+
+    space = fem.make_polynomial_space(geo, degree=2, element_basis=fem.ElementBasis.SERENDIPITY)
+    cell_grid_id = geo.cell_grid.id
+    node_grid_id = geo.vertex_grid.id
+    edge_grid = geo.edge_grid
+    edge_grid_id = edge_grid.id
+    geo.cell_arg_value(device)
+    space.topology.topo_arg_value(device)
+    space.basis.basis_arg_value(device)
+
+    wp.load_module(device=device)
+    with wp.ScopedCapture(device=device, force_module_load=False) as capture:
+        geo.rebuild(points, point_envs, status=status, point_mask=point_mask)
+
+    updated_points = wp.array([[0.0, 0.0, 0.0], [5.0, 0.0, 0.0], [0.0, 0.0, 0.0]], dtype=wp.vec3f, device=device)
+    updated_mask = wp.array([1, 1, 1], dtype=wp.int32, device=device)
+    wp.copy(points, updated_points)
+    wp.copy(point_mask, updated_mask)
+    wp.capture_launch(capture.graph)
+    wp.synchronize_device(device)
+
+    test.assertEqual(int(status.numpy()[0]), wp.Volume.REBUILD_SUCCESS)
+    test.assertIs(geo.env_offsets, env_offsets)
+    test.assertEqual(geo.env_offsets.ptr, env_offsets_ptr)
+    rebuilt_offsets = geo.env_offsets.numpy()
+    test.assertFalse(np.array_equal(rebuilt_offsets, initial_offsets))
+
+    active_cell_count = geo.cell_grid.get_active_stats().voxel_count
+    test.assertEqual(active_cell_count, 3)
+    cell_env = geo.cell_env.numpy()[:active_cell_count]
+    test.assertEqual(sorted(cell_env.tolist()), [0, 0, 1])
+
+    cell_ijks = wp.empty(shape=geo.cell_count(), dtype=wp.vec3i, device=device)
+    geo.cell_grid.get_voxels(out=cell_ijks)
+    local_cell_ijks = cell_ijks.numpy()[:active_cell_count] - rebuilt_offsets[cell_env]
+    np.testing.assert_array_equal(
+        local_cell_ijks[cell_env == 0][np.argsort(local_cell_ijks[cell_env == 0, 0])],
+        np.array([[0, 0, 0], [5, 0, 0]], dtype=np.int32),
+    )
+    np.testing.assert_array_equal(local_cell_ijks[cell_env == 1], np.array([[0, 0, 0]], dtype=np.int32))
+
+    env_0_packed_max = 5 + rebuilt_offsets[0, 0]
+    env_1_packed_start = rebuilt_offsets[1, 0]
+    test.assertGreaterEqual(env_1_packed_start - env_0_packed_max - 1, 3)
+    test.assertEqual(geo.cell_grid.id, cell_grid_id)
+    test.assertEqual(geo.vertex_grid.id, node_grid_id)
+    test.assertIs(geo.edge_grid, edge_grid)
+    test.assertEqual(geo.edge_grid.id, edge_grid_id)
+    test.assertEqual(space.topology._vertex_grid, node_grid_id)
+    test.assertEqual(space.topology._edge_grid, edge_grid_id)
+
+    with wp.ScopedDevice(device):
+        cell_mask = wp.zeros(geo.cell_count(), dtype=int, device=device)
+        cell_mask[:active_cell_count].fill_(1)
+        geo_partition = fem.ExplicitGeometryPartition(
+            geo, cell_mask, max_cell_count=active_cell_count, max_side_count=0
+        )
+        cell_domain = fem.Cells(geo_partition)
+        quadrature = fem.RegularQuadrature(cell_domain, order=1)
+        fem.interpolate(_test_sparse_environment_cells, at=quadrature, values={"cell_env": geo.cell_env})
+        fem.interpolate(_test_empty_environment_lookup, at=quadrature, values={"empty_env": 2})
+
+
 def test_nanogrid_multi_env_rebuild_preserves_explicit_offsets(test, device):
     points = wp.array([[0, 0, 0], [0, 0, 0]], dtype=wp.vec3i, device=device)
     point_envs = wp.array([0, 1], dtype=wp.int32, device=device)
@@ -996,6 +1081,30 @@ def test_nanogrid_multi_env_rebuild_preserves_explicit_offsets(test, device):
     test.assertIs(geo.env_offsets, env_offsets)
     test.assertEqual(geo.env_offsets.ptr, env_offsets_ptr)
     np.testing.assert_array_equal(geo.env_offsets.numpy(), initial_offsets)
+
+    legacy_offsets = wp.array([[2, 3, 4], [21, 3, 4]], dtype=wp.vec3i, device=device)
+    legacy_initial_offsets = legacy_offsets.numpy().copy()
+    legacy_status = wp.zeros(1, dtype=wp.uint32, device=device)
+    legacy_geo = fem.Nanogrid.from_environment_voxels(
+        (
+            wp.array([[0, 0, 0]], dtype=wp.vec3i, device=device),
+            wp.array([[0, 0, 0]], dtype=wp.vec3i, device=device),
+        ),
+        legacy_offsets,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=4,
+        max_leaf_nodes=4,
+        max_lower_nodes=4,
+        max_upper_nodes=4,
+        status=legacy_status,
+    )
+    legacy_geo.rebuild(rebuild_points, rebuild_envs, status=legacy_status)
+
+    test.assertEqual(int(legacy_status.numpy()[0]), wp.Volume.REBUILD_SUCCESS)
+    test.assertIs(legacy_geo.env_offsets, legacy_offsets)
+    np.testing.assert_array_equal(legacy_geo.env_offsets.numpy(), legacy_initial_offsets)
 
 
 def test_adaptive_nanogrid_multi_env(test, device):
@@ -1073,6 +1182,7 @@ def test_adaptive_nanogrid_multi_env(test, device):
 
 devices = get_test_devices()
 cuda_devices = get_selected_cuda_test_devices()
+capture_cuda_devices = get_selected_cuda_test_devices_with_mempool()
 
 
 class TestFemMultiEnv(unittest.TestCase):
@@ -1092,6 +1202,12 @@ add_function_test(
     "test_nanogrid_multi_env_rebuild_updates_automatic_offsets",
     test_nanogrid_multi_env_rebuild_updates_automatic_offsets,
     devices=cuda_devices,
+)
+add_function_test(
+    TestFemMultiEnv,
+    "test_nanogrid_multi_env_rebuild_capture_updates_automatic_offsets",
+    test_nanogrid_multi_env_rebuild_capture_updates_automatic_offsets,
+    devices=capture_cuda_devices,
 )
 add_function_test(
     TestFemMultiEnv,
