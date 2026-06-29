@@ -179,6 +179,9 @@ class EnvironmentSpacePartition(SpacePartition):
         If the geometry or partition layout changes between rebuilds, for example
         if the geometry environment count changes, arrays returned by
         :meth:`space_node_indices` or :attr:`env_offsets` should be reacquired.
+        Changing the topology size, environment count, device, or capacity is a
+        structural operation and is not supported inside an existing graph
+        capture.
 
         Fixed-capacity non-whole partitions use valid inactive topology indices
         as filler. Those entries remain absent from the inverse map and are
@@ -878,7 +881,8 @@ def make_space_partition(
           contiguous within each environment.
         max_node_count: If nonnegative, use this fixed node capacity to avoid device/host synchronization. For an
           environment-first partition, active nodes form an environment-major prefix, inactive capacity is covered by
-          the final environment interval, and nodes beyond the active prefix remain absent from the inverse mapping.
+          the final environment interval, and, for non-whole geometry partitions, nodes beyond the active prefix remain
+          absent from the inverse mapping.
         device: Warp device on which to perform and store computations
 
     Returns:
