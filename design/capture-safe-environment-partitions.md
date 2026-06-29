@@ -47,8 +47,10 @@ the same outer CUDA graph workflow as their single-world counterparts.
   allocation requires a host-visible count or a different allocation model.
 - Capturing Newton's dense-grid bounds construction.
 - Capturing NanoVDB topology construction for Newton's sparse MPM grid.
-- Making Newton's CG, CR, or GMRES rheology paths outer-capturable. Those paths
-  contain independent host reads for tolerance and result reporting.
+- Making Newton's isolated multi-world CG, CR, or GMRES rheology paths
+  outer-capturable. Those paths read per-environment node counts on the host for
+  batched tolerance scaling. Newton's single-world result-reporting path has
+  separately been made outer-capture-safe.
 - Claiming outer-capture support for Newton's `auto` or Gauss-Seidel nonlinear
   rheology paths. The validated public contract is Jacobi only.
 - Introducing per-environment capacity parameters or changing the public
@@ -220,10 +222,12 @@ Capacity padding is safe for the nonlinear and collision paths:
   values from a previous replay.
 
 The `auto`/Gauss-Seidel and linear Krylov configurations are not included in the
-public support claim. The Krylov paths have independent `.numpy()` calls and use
-offset-derived counts when choosing a shared absolute tolerance. A future design
-may expose exact active environment counts separately from capacity-covering
-batch offsets, but that metadata is unnecessary for the Jacobi capture path.
+public support claim. The isolated multi-world Krylov paths use a `.numpy()` read
+of offset-derived counts when choosing a shared absolute tolerance. Newton's
+single-world result reporting no longer reads the device during outer capture,
+but that does not remove the multi-world count read. A future design may expose
+exact active environment counts separately from capacity-covering batch offsets,
+but that metadata is unnecessary for the Jacobi capture path.
 
 The Newton dependency change is sequenced after the Warp PR. Local validation
 uses the Warp worktree directly. Newton's lock file should be updated only when a
