@@ -534,12 +534,18 @@ def test_nanogrid_rebuild_auxiliary_status(test, device):
 
     if device.is_cuda:
         status.zero_()
+        geo._edge_rebuild_status.zero_()
+        wp.synchronize_device(device)
         with wp.ScopedCapture(device=device, force_module_load=False) as capture:
             geo.rebuild(points, status=status)
 
-        wp.capture_launch(capture.graph)
-        wp.synchronize_device(device)
-        test.assertTrue(int(status.numpy()[0]) & wp.Volume.REBUILD_VOXEL_CAPACITY_EXCEEDED)
+        for _ in range(2):
+            status.zero_()
+            geo._edge_rebuild_status.zero_()
+            wp.synchronize_device(device)
+            wp.capture_launch(capture.graph)
+            wp.synchronize_device(device)
+            test.assertTrue(int(status.numpy()[0]) & wp.Volume.REBUILD_VOXEL_CAPACITY_EXCEEDED)
 
     cell_status = wp.zeros(1, dtype=wp.uint32, device=device)
     cell_volume = wp.Volume.allocate_by_voxels(
@@ -559,6 +565,57 @@ def test_nanogrid_rebuild_auxiliary_status(test, device):
     two_points = wp.array([[0, 0, 0], [1, 0, 0]], dtype=wp.int32, device=device)
     cell_geo.rebuild(two_points, status=cell_status)
     test.assertTrue(int(cell_status.numpy()[0]) & wp.Volume.REBUILD_VOXEL_CAPACITY_EXCEEDED)
+    test.assertEqual(int(cell_geo._node_rebuild_status.numpy()[0]), wp.Volume.REBUILD_SUCCESS)
+    test.assertEqual(int(cell_geo._edge_rebuild_status.numpy()[0]), wp.Volume.REBUILD_SUCCESS)
+
+    if device.is_cuda:
+        cell_status.zero_()
+        wp.synchronize_device(device)
+        with wp.ScopedCapture(device=device, force_module_load=False) as capture:
+            cell_geo.rebuild(two_points, status=cell_status)
+
+        for _ in range(2):
+            cell_status.zero_()
+            wp.synchronize_device(device)
+            wp.capture_launch(capture.graph)
+            wp.synchronize_device(device)
+            test.assertTrue(int(cell_status.numpy()[0]) & wp.Volume.REBUILD_VOXEL_CAPACITY_EXCEEDED)
+            test.assertEqual(int(cell_geo._node_rebuild_status.numpy()[0]), wp.Volume.REBUILD_SUCCESS)
+            test.assertEqual(int(cell_geo._edge_rebuild_status.numpy()[0]), wp.Volume.REBUILD_SUCCESS)
+
+    status_sentinel = 32
+    for status_shape in ((1, 1), (1, 1, 1), (1, 1, 1, 1), (2, 2)):
+        shaped_status = wp.full(status_shape, status_sentinel, dtype=wp.uint32, device=device)
+
+        geo.rebuild(points, status=shaped_status)
+        shaped_status_np = shaped_status.numpy().reshape(-1)
+        test.assertTrue(int(shaped_status_np[0]) & wp.Volume.REBUILD_VOXEL_CAPACITY_EXCEEDED)
+        np.testing.assert_array_equal(
+            shaped_status_np[1:], np.full(shaped_status.size - 1, status_sentinel, dtype=np.uint32)
+        )
+
+        shaped_status.fill_(status_sentinel)
+        geo.rebuild_topology_from_cells(status=shaped_status)
+        shaped_status_np = shaped_status.numpy().reshape(-1)
+        test.assertTrue(int(shaped_status_np[0]) & wp.Volume.REBUILD_VOXEL_CAPACITY_EXCEEDED)
+        np.testing.assert_array_equal(
+            shaped_status_np[1:], np.full(shaped_status.size - 1, status_sentinel, dtype=np.uint32)
+        )
+
+    status_storage = wp.full(4, status_sentinel, dtype=wp.uint32, device=device)
+    strided_status = status_storage[1::2]
+    test.assertFalse(strided_status.is_contiguous)
+
+    geo.rebuild(points, status=strided_status)
+    status_storage_np = status_storage.numpy()
+    test.assertTrue(int(status_storage_np[1]) & wp.Volume.REBUILD_VOXEL_CAPACITY_EXCEEDED)
+    np.testing.assert_array_equal(status_storage_np[[0, 2, 3]], np.full(3, status_sentinel, dtype=np.uint32))
+
+    status_storage.fill_(status_sentinel)
+    geo.rebuild_topology_from_cells(status=strided_status)
+    status_storage_np = status_storage.numpy()
+    test.assertTrue(int(status_storage_np[1]) & wp.Volume.REBUILD_VOXEL_CAPACITY_EXCEEDED)
+    np.testing.assert_array_equal(status_storage_np[[0, 2, 3]], np.full(3, status_sentinel, dtype=np.uint32))
 
 
 def test_nanogrid_rebuild_capture(test, device):

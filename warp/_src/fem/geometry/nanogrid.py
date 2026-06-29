@@ -1131,12 +1131,13 @@ class Nanogrid(NanogridBase):
             )
 
         if status is not None:
+            status_view = _nanogrid_rebuild_status_view(status)
             wp.launch(
                 _aggregate_nanogrid_rebuild_status,
                 dim=1,
                 inputs=[
-                    status,
-                    node_status,
+                    status_view,
+                    node_status if preserve_status else status_view,
                     self._edge_rebuild_status,
                     int(self._edge_candidates is not None),
                     int(preserve_status),
@@ -1561,6 +1562,19 @@ def _pack_environment_voxels_world(
     packed_ijk[point] = (
         _world_point_cell_ijk(points[point], inverse_transform, translation) + env_offsets[point_envs[point]]
     )
+
+
+def _nanogrid_rebuild_status_view(status: wp.array) -> wp.array:
+    status_view = wp.array(
+        data=None,
+        ptr=status.ptr,
+        capacity=status.capacity,
+        device=status.device,
+        dtype=wp.uint32,
+        shape=1,
+    )
+    status_view._ref = status
+    return status_view
 
 
 def _nanogrid_rebuild_points_array(points: wp.array, device) -> wp.array:
