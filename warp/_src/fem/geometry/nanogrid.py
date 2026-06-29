@@ -628,7 +628,9 @@ class Nanogrid(NanogridBase):
         if points is None:
             raise TypeError("points is required")
 
+        automatic_env_offsets = env_offsets is None
         if not isinstance(points, wp.array):
+            automatic_env_offsets = automatic_env_offsets and point_envs is None
             points, point_envs, env_count, env_offsets = _environment_voxels_from_legacy_sequence(
                 points, point_envs, env_count, env_offsets, device
             )
@@ -659,6 +661,8 @@ class Nanogrid(NanogridBase):
             cell_env=cell_env,
             env_offsets=env_offsets,
             rebuildable=rebuildable,
+            automatic_env_offsets=automatic_env_offsets,
+            guard_cells=guard_cells,
         )
 
     def __init__(
@@ -669,6 +673,8 @@ class Nanogrid(NanogridBase):
         cell_env: wp.array | None = None,
         env_offsets: wp.array | None = None,
         rebuildable: bool = False,
+        automatic_env_offsets: bool = False,
+        guard_cells: int = 3,
     ):
         """Construct a sparse grid geometry from an in-memory NanoVDB volume.
 
@@ -682,6 +688,9 @@ class Nanogrid(NanogridBase):
                 :meth:`rebuild_topology_from_cells`. Auxiliary edge topology required by a FEM space is allocated
                 lazily when the space is constructed. FEM spaces and their required topology must be materialized before
                 CUDA graph capture; only subsequent in-place topology refreshes are capture-safe.
+            automatic_env_offsets: Whether ``env_offsets`` were generated automatically and should be refreshed before
+                packing multi-environment rebuild points.
+            guard_cells: Number of empty packed cells to preserve between automatically packed environments.
         """
 
         self._cell_grid = grid
@@ -721,6 +730,21 @@ class Nanogrid(NanogridBase):
         self._rebuildable = rebuildable
         self._node_candidates = node_candidates
         self._node_candidate_mask = node_candidate_mask
+
+        self._automatic_env_offsets = automatic_env_offsets and self.environment_count() > 1
+        self._env_offset_guard_cells = guard_cells
+        self._env_offset_cell_counts = None
+        self._env_offset_min_x = None
+        self._env_offset_max_x = None
+        self._env_offset_spans = None
+        self._env_offset_starts = None
+        if rebuildable and self._automatic_env_offsets:
+            env_count = self.environment_count()
+            self._env_offset_cell_counts = wp.empty(shape=env_count, dtype=int, device=device)
+            self._env_offset_min_x = wp.empty(shape=env_count, dtype=int, device=device)
+            self._env_offset_max_x = wp.empty(shape=env_count, dtype=int, device=device)
+            self._env_offset_spans = wp.empty(shape=env_count, dtype=int, device=device)
+            self._env_offset_starts = wp.empty(shape=env_count, dtype=int, device=device)
 
         self._edge_count = 0
         self._edge_grid = None
@@ -773,6 +797,9 @@ class Nanogrid(NanogridBase):
             _, inverse_transform, translation_vec = _environment_transform_args(
                 None, self._cell_grid_info.translation, self._cell_grid_info.transform_matrix
             )
+            self._refresh_automatic_environment_offsets(
+                points, point_envs, point_mask, inverse_transform, translation_vec
+            )
             packed_points = _pack_environment_points(
                 points,
                 point_envs,
@@ -793,6 +820,83 @@ class Nanogrid(NanogridBase):
 
         self.rebuild_topology_from_cells()
         return status
+
+    def _refresh_automatic_environment_offsets(
+        self,
+        points: wp.array,
+        point_envs: wp.array,
+        point_mask: wp.array | None,
+        inverse_transform: wp.mat33f,
+        translation_vec: wp.vec3f,
+    ):
+        if self._env_offset_cell_counts is None:
+            return
+
+        device = self._cell_grid.device
+        env_count = self.environment_count()
+        wp.launch(
+            _initialize_environment_bounds,
+            dim=env_count,
+            inputs=[self._env_offset_cell_counts, self._env_offset_min_x, self._env_offset_max_x],
+            device=device,
+        )
+        if wp.types.types_equal(points.dtype, wp.vec3i):
+            wp.launch(
+                _accumulate_environment_bounds_ijk,
+                dim=points.shape[0],
+                inputs=[
+                    points,
+                    point_envs,
+                    point_mask,
+                    self._env_offset_cell_counts,
+                    self._env_offset_min_x,
+                    self._env_offset_max_x,
+                ],
+                device=device,
+            )
+        else:
+            wp.launch(
+                _accumulate_environment_bounds_world,
+                dim=points.shape[0],
+                inputs=[
+                    points,
+                    point_envs,
+                    point_mask,
+                    inverse_transform,
+                    translation_vec,
+                    self._env_offset_cell_counts,
+                    self._env_offset_min_x,
+                    self._env_offset_max_x,
+                ],
+                device=device,
+            )
+
+        wp.launch(
+            _compute_environment_spans,
+            dim=env_count,
+            inputs=[
+                self._env_offset_cell_counts,
+                self._env_offset_min_x,
+                self._env_offset_max_x,
+                self._env_offset_guard_cells,
+                1,
+                self._env_offset_spans,
+            ],
+            device=device,
+        )
+        utils.array_scan(self._env_offset_spans, self._env_offset_starts, inclusive=False)
+        wp.launch(
+            _compute_environment_offsets_from_starts,
+            dim=env_count,
+            inputs=[
+                self._env_offset_cell_counts,
+                self._env_offset_min_x,
+                self._env_offset_starts,
+                1,
+                self._env_offsets,
+            ],
+            device=device,
+        )
 
     def rebuild_topology_from_cells(self):
         """Refresh Nanogrid topology buffers from the current cell grid."""

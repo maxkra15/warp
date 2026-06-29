@@ -926,6 +926,78 @@ def test_nanogrid_multi_env_rebuildable(test, device):
     test.assertEqual(geo.environment_count(), 2)
 
 
+def test_nanogrid_multi_env_rebuild_updates_automatic_offsets(test, device):
+    points = wp.array([[0, 0, 0], [0, 0, 0]], dtype=wp.vec3i, device=device)
+    point_envs = wp.array([0, 1], dtype=wp.int32, device=device)
+    status = wp.zeros(1, dtype=wp.uint32, device=device)
+    geo = fem.Nanogrid.from_environment_voxels(
+        points,
+        point_envs,
+        2,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=4,
+        max_leaf_nodes=4,
+        max_lower_nodes=4,
+        max_upper_nodes=4,
+        status=status,
+    )
+    env_offsets = geo.env_offsets
+    env_offsets_ptr = env_offsets.ptr
+    initial_offsets = env_offsets.numpy().copy()
+
+    rebuild_points = wp.array([[0, 0, 0], [4, 0, 0], [0, 0, 0]], dtype=wp.vec3i, device=device)
+    rebuild_envs = wp.array([0, 0, 1], dtype=wp.int32, device=device)
+    geo.rebuild(rebuild_points, rebuild_envs, status=status)
+
+    test.assertEqual(int(status.numpy()[0]), wp.Volume.REBUILD_SUCCESS)
+    test.assertEqual(geo.cell_grid.get_active_stats().voxel_count, 3)
+    test.assertIs(geo.env_offsets, env_offsets)
+    test.assertEqual(geo.env_offsets.ptr, env_offsets_ptr)
+
+    rebuilt_offsets = geo.env_offsets.numpy()
+    test.assertFalse(np.array_equal(rebuilt_offsets, initial_offsets))
+    env_0_packed_max = 4 + rebuilt_offsets[0, 0]
+    env_1_packed_start = rebuilt_offsets[1, 0]
+    test.assertGreaterEqual(env_1_packed_start - env_0_packed_max - 1, 3)
+
+    live_cell_count = geo.cell_grid.get_active_stats().voxel_count
+    test.assertEqual(sorted(geo.cell_env.numpy()[:live_cell_count].tolist()), [0, 0, 1])
+
+
+def test_nanogrid_multi_env_rebuild_preserves_explicit_offsets(test, device):
+    points = wp.array([[0, 0, 0], [0, 0, 0]], dtype=wp.vec3i, device=device)
+    point_envs = wp.array([0, 1], dtype=wp.int32, device=device)
+    env_offsets = wp.array([[1, 2, 3], [20, 2, 3]], dtype=wp.vec3i, device=device)
+    status = wp.zeros(1, dtype=wp.uint32, device=device)
+    geo = fem.Nanogrid.from_environment_voxels(
+        points,
+        point_envs,
+        2,
+        env_offsets=env_offsets,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=4,
+        max_leaf_nodes=4,
+        max_lower_nodes=4,
+        max_upper_nodes=4,
+        status=status,
+    )
+    env_offsets_ptr = env_offsets.ptr
+    initial_offsets = env_offsets.numpy().copy()
+
+    rebuild_points = wp.array([[0, 0, 0], [4, 0, 0], [0, 0, 0]], dtype=wp.vec3i, device=device)
+    rebuild_envs = wp.array([0, 0, 1], dtype=wp.int32, device=device)
+    geo.rebuild(rebuild_points, rebuild_envs, status=status)
+
+    test.assertEqual(int(status.numpy()[0]), wp.Volume.REBUILD_SUCCESS)
+    test.assertIs(geo.env_offsets, env_offsets)
+    test.assertEqual(geo.env_offsets.ptr, env_offsets_ptr)
+    np.testing.assert_array_equal(geo.env_offsets.numpy(), initial_offsets)
+
+
 def test_adaptive_nanogrid_multi_env(test, device):
     if platform.system() == "Windows":
         test.skipTest("Skipping test due to NVRTC bug on Windows")
@@ -1014,6 +1086,18 @@ add_function_test(TestFemMultiEnv, "test_mesh_multi_env", test_mesh_multi_env, d
 add_function_test(TestFemMultiEnv, "test_nanogrid_multi_env", test_nanogrid_multi_env, devices=cuda_devices)
 add_function_test(
     TestFemMultiEnv, "test_nanogrid_multi_env_rebuildable", test_nanogrid_multi_env_rebuildable, devices=cuda_devices
+)
+add_function_test(
+    TestFemMultiEnv,
+    "test_nanogrid_multi_env_rebuild_updates_automatic_offsets",
+    test_nanogrid_multi_env_rebuild_updates_automatic_offsets,
+    devices=cuda_devices,
+)
+add_function_test(
+    TestFemMultiEnv,
+    "test_nanogrid_multi_env_rebuild_preserves_explicit_offsets",
+    test_nanogrid_multi_env_rebuild_preserves_explicit_offsets,
+    devices=cuda_devices,
 )
 add_function_test(
     TestFemMultiEnv, "test_adaptive_nanogrid_multi_env", test_adaptive_nanogrid_multi_env, devices=cuda_devices
