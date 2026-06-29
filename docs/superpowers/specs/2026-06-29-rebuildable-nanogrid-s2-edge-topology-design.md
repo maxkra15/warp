@@ -63,6 +63,10 @@ Constructing new FEM spaces during graph capture remains unsupported, as it
 already requires allocation. Required topology must be materialized before
 capture.
 
+Downstream consumers can feature-detect persistent edge support with
+`getattr(fem.Nanogrid, "REBUILDABLE_EDGE_TOPOLOGY", False)` instead of
+inferring it from `Volume` rebuildability or a Warp version.
+
 ## Scope Boundaries
 
 This change intentionally does not make face topology rebuildable. S2 has only

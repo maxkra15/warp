@@ -546,6 +546,9 @@ def _make_nanogrid_side_arg(cell_arg_type, scalar_type):
 class Nanogrid(NanogridBase):
     """Sparse grid geometry."""
 
+    REBUILDABLE_EDGE_TOPOLOGY: ClassVar[bool] = True
+    """Whether materialized edge topology is refreshed in place for rebuildable instances."""
+
     _dynamic_attribute_constructors: ClassVar = {
         # Functions that capture face_tangent_vecs (itself dynamic)
         "side_deformation_gradient": lambda obj: obj._make_side_deformation_gradient(),

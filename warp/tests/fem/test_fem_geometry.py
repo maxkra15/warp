@@ -496,6 +496,8 @@ def test_nanogrid_rebuild_edge_capacity(test, device):
 
 
 def test_nanogrid_rebuild_capture(test, device):
+    test.assertTrue(fem.Nanogrid.REBUILDABLE_EDGE_TOPOLOGY)
+
     points_initial = wp.array([[0, 0, 0]], dtype=wp.int32, device=device)
     points_rebuild = wp.array([[0, 0, 0], [1, 0, 0], [1, 0, 0], [3, 0, 0], [4, 0, 0]], dtype=wp.int32, device=device)
     point_mask = wp.array([1, 1, 0, 1, 0], dtype=wp.int32, device=device)
