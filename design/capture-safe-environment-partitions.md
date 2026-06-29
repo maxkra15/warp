@@ -38,7 +38,7 @@ the same outer CUDA graph workflow as their single-world counterparts.
 | R6 | Preserve the existing exact-size behavior when `max_node_count < 0` | Must | Includes host synchronization and environmentless-node handling |
 | R7 | Preserve deterministic prefix truncation when capacity is below the live node count | Must | Existing `max_node_count` behavior |
 | R8 | Support empty environments, zero capacity, underfilled capacity, exact fit, and overflow | Must | Offsets remain monotonic in every case |
-| R9 | Demonstrate end-to-end outer CUDA graph replay in Newton's isolated fixed-grid implicit MPM solver | Must | Eager and captured trajectories must agree |
+| R9 | Demonstrate end-to-end outer CUDA graph replay in Newton's isolated fixed-grid implicit MPM Jacobi solver | Must | Eager and captured trajectories must agree |
 | R10 | Avoid new required dependencies and native-code changes | Should | The fix belongs in Warp FEM's Python/device-kernel layer |
 
 **Non-goals**:
@@ -49,6 +49,8 @@ the same outer CUDA graph workflow as their single-world counterparts.
 - Capturing NanoVDB topology construction for Newton's sparse MPM grid.
 - Making Newton's CG, CR, or GMRES rheology paths outer-capturable. Those paths
   contain independent host reads for tolerance and result reporting.
+- Claiming outer-capture support for Newton's `auto` or Gauss-Seidel nonlinear
+  rheology paths. The validated public contract is Jacobi only.
 - Introducing per-environment capacity parameters or changing the public
   `make_space_partition()` signature.
 - Optimizing fixed-capacity matrix memory use; in-place sparse-matrix compression
@@ -144,11 +146,29 @@ replaced, the cached `partition_arg_value` must be invalidated so subsequent
 launches cannot retain a stale mapping pointer.
 
 FEM temporaries borrowed while either APIC or native CUDA graph capture is
-active bypass `TemporaryStore`'s recycling pools. Capture-local allocations are
-therefore owned by the captured graph or APIC recording rather than being made
-available to an unrelated borrower while the graph still retains their
-pointers. Persistent partition outputs remain owned by the partition object and
-are reused in place.
+active bypass `TemporaryStore`'s recycling pools. A native CUDA capture must
+also keep their allocations outside the captured graph: a persistent partition
+output has no matching free node, and replaying a graph with such an unmatched
+allocation is invalid after the first launch.
+
+Warp therefore uses one generic capture-safe allocation scope shared by FEM and
+deterministic execution. For native CUDA capture, it temporarily switches the
+thread capture mode to relaxed, allocates on a dedicated non-capturing stream,
+synchronizes that stream, and restores the capturing stream before recording
+work that consumes the array. The exact active `Graph` is resolved from the
+current capturing stream and capture ID. That graph retains a strong reference
+to every external array, while a FEM `Temporary` stores only a weak reference
+back to the graph. `Temporary.release()` is a no-op while the graph lives, so
+scratch releases cannot recycle or deallocate graph-referenced memory and no
+reference cycle prevents eventual cleanup. Graph destruction precedes release
+of the retained arrays.
+
+CPU and cross-device APIC capture retain their existing region-tracking path.
+For `requires_grad` temporaries, allocation-time gradient initialization occurs
+on the non-capturing stream, and an explicit zero is additionally recorded on
+the capturing stream so every replay preserves the normal initialization
+semantics. Persistent partition outputs remain owned by both the partition and,
+for capture lifetime safety, the graph, and are reused in place.
 
 The rebuild documentation will state that changing topology size, environment
 count, device, or capacity is structural and is not supported inside an already
@@ -179,8 +199,10 @@ The supported outer-capture configuration is:
 
 - isolated multi-world mode;
 - a fixed MPM grid;
-- a non-negative `max_active_cell_count`; and
-- a graph-compatible nonlinear rheology solver (`auto`/Gauss-Seidel or Jacobi).
+- a non-negative `max_active_cell_count`;
+- the Jacobi nonlinear rheology solver;
+- an enabled CUDA memory pool on the capture device; and
+- disabled Newton timers while recording and replaying the outer graph.
 
 Capacity padding is safe for the nonlinear and collision paths:
 
@@ -190,12 +212,18 @@ Capacity padding is safe for the nonlinear and collision paths:
 - Padding contributes zero residual. Nonlinear convergence requires both the
   batch L2 condition and its maximum residual condition, so final-batch padding
   cannot cause premature convergence.
+- Proximal regularization keeps Delassus factorization safe for empty padded
+  strain rows; those rows are then detected before the Jacobi local solve and
+  skipped, avoiding non-finite filler values.
+- Elastic and plastic rheology postprocess outputs are explicitly zeroed for
+  empty rows, so inactive capacity slots remain finite and cannot retain stale
+  values from a previous replay.
 
-Linear Krylov configurations are not included in the support claim. They have
-independent `.numpy()` calls and use offset-derived counts when choosing a shared
-absolute tolerance. A future design may expose exact active environment counts
-separately from capacity-covering batch offsets, but that metadata is unnecessary
-for the nonlinear capture path.
+The `auto`/Gauss-Seidel and linear Krylov configurations are not included in the
+public support claim. The Krylov paths have independent `.numpy()` calls and use
+offset-derived counts when choosing a shared absolute tolerance. A future design
+may expose exact active environment counts separately from capacity-covering
+batch offsets, but that metadata is unnecessary for the Jacobi capture path.
 
 The Newton dependency change is sequenced after the Warp PR. Local validation
 uses the Warp worktree directly. Newton's lock file should be updated only when a
@@ -255,13 +283,22 @@ module:
    behavior.
 6. **Captured rebuild and replay**: capture `ExplicitGeometryPartition.rebuild()`
    followed by `EnvironmentSpacePartition.rebuild()`, then replay with at least
-   two different cell masks. Verify that mappings and offsets change while array
-   objects and pointers remain stable.
+   two different cell masks. Verify repeated replay, changing mappings and
+   offsets, and stable array objects and pointers. Also construct a capped
+   partition inside capture and replay twice to cover persistent output
+   allocation.
 7. **Captured FEM integration**: assemble through an environment-first partition
    inside capture and compare values and sparsity with eager execution.
 8. **Batched numerical smoke test**: use underfilled offsets in a batched reduction
    or `LinearOperator` operation to prove every capacity slot belongs to a valid
    batch.
+9. **Capture-owned temporary lifetime**: release a FEM temporary during native
+   capture, replay the graph at least twice, prove its pointer is not reissued
+   while the graph lives, and verify that it becomes releasable after graph
+   destruction.
+10. **Uncapped device migration**: rebuild an exact-count environment partition
+    from CPU to CUDA and verify that `_node_indices` is replaced on the target
+    device rather than reused solely because its shape matches.
 
 Correctness cases run on CPU and CUDA where supported. Capture/replay cases run on
 devices selected by Warp's graph-capture test utilities. Tests assert results and
@@ -269,13 +306,15 @@ pointer stability, never timing ratios.
 
 ### Newton Tests
 
-Add one focused CUDA-only end-to-end regression to
+Add a focused CUDA-only end-to-end regression to
 `newton/tests/test_implicit_mpm.py`:
 
-1. Build two coincident worlds with identical small particle blocks and opposite
-   x velocities.
+1. Build two coincident worlds with identical small particle blocks. Give them
+   opposing translational motion plus compressive and shear components so replay
+   exercises nontrivial strain evolution as well as world separation.
 2. Use fixed-grid PIC, isolated worlds, Jacobi, a conservative active-cell
-   capacity, zero convergence tolerance, and a fixed iteration budget.
+   capacity, an enabled CUDA memory pool, disabled timers, zero convergence
+   tolerance, and a fixed iteration budget.
 3. Construct independent eager and captured solver/state pairs from identical
    initial data.
 4. Capture two substeps so the graph contains both directions of the existing
@@ -288,8 +327,16 @@ Add one focused CUDA-only end-to-end regression to
 8. Verify opposite per-world displacement/velocity signs, demonstrating that
    colocated worlds remain isolated under replay.
 
-The test skips devices without the CUDA memory-pool and conditional-graph
-capabilities required by the existing implicit rheology graph path.
+Add a focused Jacobi numerical regression that runs 50 iterations on otherwise
+identical capped and uncapped systems. Compare the active solution values and
+require every padded strain and postprocess output to remain finite, including
+empty filler rows. This isolates capacity-safety behavior from outer-graph
+mechanics and guards the empty-row and output-initialization rules directly.
+
+The outer-capture test skips devices without the CUDA memory-pool and
+conditional-graph capabilities required by the existing implicit rheology graph
+path, and also skips when that memory pool is not already enabled. Timers remain
+disabled throughout the captured run.
 
 ### Documentation and Performance Validation
 
@@ -297,9 +344,10 @@ capabilities required by the existing implicit rheology graph path.
   semantics and final-environment padding.
 - Add a Warp changelog entry describing capture-safe capped environment-first
   rebuilds.
-- Update Newton's world documentation to state that isolated fixed-grid
-  nonlinear MPM supports outer CUDA graph capture, while dense, sparse, and
-  linear Krylov limitations remain.
+- Update Newton's world documentation to state that isolated fixed-grid Jacobi
+  MPM supports outer CUDA graph capture when the memory pool is enabled and
+  timers are disabled; `auto`/Gauss-Seidel, dense, sparse, and linear Krylov
+  limitations remain.
 - Add a Newton changelog entry for the restored capture capability.
 - Retain the existing Newton multi-world ASV benchmark. Use a local eager versus
   graph-replay timing probe to quantify launch-overhead improvement, but do not

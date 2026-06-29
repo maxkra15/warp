@@ -28,6 +28,7 @@ import types
 import weakref
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from copy import copy as shallowcopy
 from pathlib import Path
 from typing import (
@@ -5176,6 +5177,93 @@ def _validate_cuda_arch_suffix(
 DeviceLike = Device | str | None
 
 
+_capture_external_allocation_streams: dict[str, Stream] = {}
+
+
+def _capture_external_allocation_stream(device: Device) -> Stream:
+    """Return the dedicated non-capturing allocation stream for ``device``."""
+    stream = _capture_external_allocation_streams.get(device.alias)
+    if stream is None:
+        stream = Stream(device)
+        _capture_external_allocation_streams[device.alias] = stream
+    return stream
+
+
+def get_active_capture_graph(device: DeviceLike = None, stream: Stream | None = None) -> Graph | None:
+    """Return the graph that owns allocations made for ``device`` during capture.
+
+    Native CUDA capture ownership is resolved from the current stream's exact
+    capture ID. APIC capture may also own CPU, pinned, or cross-device arrays,
+    so its active graph is the fallback when the target stream is not capturing.
+    """
+    if stream is not None:
+        if device is not None and runtime.get_device(device) != stream.device:
+            raise ValueError(f"Stream device '{stream.device}' does not match requested device '{device}'")
+        device = stream.device
+    else:
+        device = runtime.get_device(device)
+        stream = device.stream if device.is_cuda else None
+
+    if stream is not None and stream.is_capturing:
+        capture_id = runtime.core.wp_cuda_stream_get_capture_id(stream.cuda_stream)
+        graph = runtime.captures.get(capture_id)
+        if graph is None:
+            raise RuntimeError(
+                f"CUDA stream on device '{device}' is capturing, but its graph is not registered with Warp"
+            )
+        return graph
+
+    if runtime._apic_capture is not None:
+        if runtime._apic_graph is None:
+            raise RuntimeError("APIC capture is active, but its graph is not registered with Warp")
+        return runtime._apic_graph
+
+    return None
+
+
+@contextmanager
+def capture_external_allocation_scope(
+    device: DeviceLike,
+    graph: Graph | None,
+    stream: Stream | None = None,
+):
+    """Redirect native-capture allocations to a synchronized side stream.
+
+    Yields ``True`` when allocation is redirected. Initialization performed in
+    that case is not captured and must be recorded explicitly when replay-time
+    initialization is required.
+    """
+    if stream is not None:
+        if device is not None and runtime.get_device(device) != stream.device:
+            raise ValueError(f"Stream device '{stream.device}' does not match requested device '{device}'")
+        device = stream.device
+    else:
+        device = runtime.get_device(device)
+        stream = device.stream if device.is_cuda else None
+
+    if graph is None or stream is None or not stream.is_capturing:
+        yield False
+        return
+
+    active_graph = get_active_capture_graph(device, stream=stream)
+    if active_graph is not graph:
+        raise RuntimeError("Active CUDA capture graph changed before external allocation")
+
+    alloc_stream = _capture_external_allocation_stream(device)
+    previous_mode = runtime.core.wp_cuda_thread_exchange_capture_mode(int(CaptureMode.RELAXED))
+    if previous_mode < 0:
+        raise RuntimeError(f"Failed to switch thread capture mode: {runtime.get_error_string()}")
+    try:
+        with warp.ScopedStream(alloc_stream, sync_enter=False):
+            yield True
+        # Synchronizing this non-capturing stream is legal while relaxed mode
+        # is active and makes the external allocation visible to captured work.
+        runtime.core.wp_cuda_stream_synchronize(alloc_stream.cuda_stream)
+    finally:
+        if runtime.core.wp_cuda_thread_exchange_capture_mode(previous_mode) < 0:
+            raise RuntimeError(f"Failed to restore thread capture mode: {runtime.get_error_string()}")
+
+
 class Graph:
     """A handle to a captured graph of Warp operations.
 
@@ -5196,7 +5284,9 @@ class Graph:
         self.device = device
         self.capture_id = capture_id
         self.module_execs: set[ModuleExec] = set()
-        self._deterministic_buffer_refs: list[Any] = []
+        self._capture_array_refs: list[Any] = []
+        # Backward-compatible alias for tests and downstream diagnostics.
+        self._deterministic_buffer_refs = self._capture_array_refs
         self.graph_exec: ctypes.c_void_p | None = None
         self.graph: ctypes.c_void_p | None = None
 
@@ -5257,6 +5347,10 @@ class Graph:
     # retain executable CUDA modules used by this graph, which prevents them from being unloaded
     def _retain_module_exec(self, module_exec: ModuleExec):
         self.module_execs.add(module_exec)
+
+    def _retain_capture_array(self, array):
+        """Keep an externally allocated array alive until after graph destruction."""
+        self._capture_array_refs.append(array)
 
     def _validate_param_array(self, name: str, arr) -> None:
         if not warp._src.types.is_array(arr):

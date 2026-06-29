@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import platform
+import tempfile
 import unittest
 
 import numpy as np
@@ -280,6 +281,19 @@ def _assert_capped_environment_partition(
     np.testing.assert_array_equal(offsets, np.array(env_offsets, dtype=np.int32))
     test.assertTrue(np.all(offsets[:-1] <= offsets[1:]))
     test.assertEqual(offsets[-1], capacity)
+
+
+def _assert_graph_allocations_balanced(test, graph):
+    with tempfile.TemporaryDirectory() as temp_dir:
+        dot_path = f"{temp_dir}/graph.dot"
+        wp.capture_debug_dot_print(graph, dot_path, verbose=True)
+        with open(dot_path, encoding="utf-8") as dot_file:
+            dot = dot_file.read().lower()
+    test.assertEqual(
+        dot.count("mem_alloc"),
+        dot.count("mem_free"),
+        "captured graph contains persistent allocations without matching frees",
+    )
 
 
 def test_environment_space_partition_fixed_capacity(test, device):
@@ -665,6 +679,77 @@ def test_environment_space_partition_capture_temporary_reuse(test, device):
             env_offsets=[0, 2, 2, 5],
             node_indices=[0, 1, 4, 2, 3],
         )
+
+
+def test_environment_space_partition_capture_construction_replay(test, device):
+    with wp.ScopedDevice(device):
+        geo = fem.Grid2D(res=wp.vec2i(2, 1), env_count=3)
+        cell_mask = wp.array([1, 1, 0, 0, 1, 0], dtype=int, device=device)
+        geo_partition = fem.ExplicitGeometryPartition(
+            geo,
+            cell_mask,
+            max_cell_count=4,
+            max_side_count=0,
+        )
+        space = fem.make_polynomial_space(geo, degree=0, discontinuous=True)
+
+        # Preload every module used by construction before entering capture.
+        fem.make_space_partition(
+            space_topology=space.topology,
+            geometry_partition=geo_partition,
+            environment_first=True,
+            with_halo=False,
+            max_node_count=5,
+            device=device,
+        )
+
+        temporary_store = fem.TemporaryStore()
+        with wp.ScopedCapture(device=device, force_module_load=False) as capture:
+            partition = fem.make_space_partition(
+                space_topology=space.topology,
+                geometry_partition=geo_partition,
+                environment_first=True,
+                with_halo=False,
+                max_node_count=5,
+                device=device,
+                temporary_store=temporary_store,
+            )
+
+        _assert_graph_allocations_balanced(test, capture.graph)
+        for _ in range(2):
+            wp.capture_launch(capture.graph)
+            _assert_capped_environment_partition(
+                test,
+                partition,
+                capacity=5,
+                active_nodes=[0, 1, 4],
+                env_offsets=[0, 2, 2, 5],
+                node_indices=[0, 1, 4, 2, 3],
+            )
+
+
+def test_environment_space_partition_uncapped_device_migration(test, device):
+    source_device = wp.get_device("cpu")
+    with wp.ScopedDevice(source_device):
+        geo = fem.Grid2D(res=wp.vec2i(2, 1), env_count=2)
+        space = fem.make_polynomial_space(geo, degree=0, discontinuous=True)
+        partition = fem.make_space_partition(
+            space_topology=space.topology,
+            environment_first=True,
+            device=source_device,
+        )
+        old_node_indices = partition.space_node_indices()
+
+    partition.rebuild(device=device)
+
+    test.assertIsNot(partition.space_node_indices(), old_node_indices)
+    test.assertIsNone(old_node_indices.deleter)
+    test.assertEqual(partition.space_node_indices().device, device)
+    test.assertEqual(partition.partition_arg_value(device).space_to_partition.device, device)
+    np.testing.assert_array_equal(
+        partition.space_node_indices().numpy(),
+        np.arange(space.node_count(), dtype=np.int32),
+    )
 
 
 def _make_env_offsets(offsets, device):
@@ -1359,6 +1444,18 @@ add_function_test(
     "test_environment_space_partition_capture_temporary_reuse",
     test_environment_space_partition_capture_temporary_reuse,
     devices=capture_devices,
+)
+add_function_test(
+    TestFemMultiEnv,
+    "test_environment_space_partition_capture_construction_replay",
+    test_environment_space_partition_capture_construction_replay,
+    devices=capture_devices,
+)
+add_function_test(
+    TestFemMultiEnv,
+    "test_environment_space_partition_uncapped_device_migration",
+    test_environment_space_partition_uncapped_device_migration,
+    devices=cuda_devices[:1],
 )
 
 if __name__ == "__main__":

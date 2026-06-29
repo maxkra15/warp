@@ -385,7 +385,11 @@ class EnvironmentSpacePartition(SpacePartition):
             min(max_node_count, full_partition_node_count) if max_node_count >= 0 else full_partition_node_count
         )
 
-        if self._node_indices is None or self._node_indices.shape[0] != partition_node_count:
+        if (
+            self._node_indices is None
+            or self._node_indices.shape[0] != partition_node_count
+            or self._node_indices.device != device
+        ):
             if self._node_indices is not None:
                 if self._space_to_partition is self._node_indices:
                     self._space_to_partition = None
