@@ -679,16 +679,17 @@ void allocate_rebuildable_grid_from_points_host_impl(
     }
 
     const uint32_t capacity_status = rebuild_capacity_status(scratch, capacities);
-    const VolumeRebuildCapacities exact_capacities = rebuild_exact_capacities(scratch);
-    const VolumeRebuildCapacities& layout_capacities
-        = capacity_status == WP_VOLUME_REBUILD_SUCCESS ? capacities : exact_capacities;
-
-    out_grid_size
-        = std::max(rebuildable_grid_size<BuildT>(capacities), rebuildable_grid_size<BuildT>(exact_capacities));
+    out_grid_size = rebuildable_grid_size<BuildT>(capacities);
     out_grid = static_cast<nanovdb::Grid<nanovdb::NanoTree<BuildT>>*>(
         wp_alloc_host(out_grid_size, "(native:volume_builder)")
     );
-    rebuild_populate_grid(out_grid, out_grid_size, scratch, layout_capacities, params);
+    if (capacity_status == WP_VOLUME_REBUILD_SUCCESS) {
+        rebuild_populate_grid(out_grid, out_grid_size, scratch, capacities, params);
+    } else {
+        HostRebuildScratch empty_scratch;
+        empty_scratch.active_voxel_grid = scratch.active_voxel_grid;
+        rebuild_populate_grid(out_grid, out_grid_size, empty_scratch, capacities, params);
+    }
 
     if (status) {
         *status = capacity_status;

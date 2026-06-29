@@ -85,7 +85,8 @@
   ([GH-1594](https://github.com/NVIDIA/warp/issues/1594)). The arguments and attributes now emit `DeprecationWarning`
   and are scheduled for removal in Warp 1.19. Output arrays are sized dynamically, extraction runs on the input field's
   device, and the `id` and `runtime` attributes have no replacement.
-- Deprecate the per-environment sequence form of `warp.fem.Nanogrid.from_environment_voxels()`; pass flat `points`,
+- Deprecate the per-environment sequence form of `warp.fem.Nanogrid.from_environment_voxels()` and
+  `warp.fem.AdaptiveNanogrid.from_environment_voxels()`; pass flat `points`, `cell_levels` where applicable,
   `point_envs`, and `env_count` instead.
 
 ### Changed

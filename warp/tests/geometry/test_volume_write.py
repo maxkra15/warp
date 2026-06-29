@@ -1285,6 +1285,27 @@ class TestVolumeWrite(unittest.TestCase):
         overflow_volume.rebuild(wp.array([[1, 2, 3], [4, 5, 6]], dtype=wp.int32, device="cpu"), status=overflow_status)
         self.assertTrue(int(overflow_status.numpy()[0]) & wp.Volume.REBUILD_VOXEL_CAPACITY_EXCEEDED)
 
+        initial_overflow_status = wp.zeros(1, dtype=wp.uint32, device="cpu")
+        initial_overflow_volume = wp.Volume.allocate_by_voxels(
+            wp.array([[1, 2, 3], [4, 5, 6]], dtype=wp.int32, device="cpu"),
+            voxel_size=1.0,
+            device="cpu",
+            rebuildable=True,
+            max_active_voxels=1,
+            max_leaf_nodes=1,
+            max_lower_nodes=1,
+            max_upper_nodes=1,
+            status=initial_overflow_status,
+        )
+        self.assertTrue(int(initial_overflow_status.numpy()[0]) & wp.Volume.REBUILD_VOXEL_CAPACITY_EXCEEDED)
+        self.assertEqual(initial_overflow_volume.get_rebuild_info(), wp.Volume.RebuildInfo("voxels", 1, 1, 1, 1))
+        initial_overflow_stats = initial_overflow_volume.get_active_stats()
+        self.assertLessEqual(initial_overflow_stats.voxel_count, 1)
+        self.assertLessEqual(initial_overflow_stats.leaf_node_count, 1)
+        self.assertLessEqual(initial_overflow_stats.lower_node_count, 1)
+        self.assertLessEqual(initial_overflow_stats.upper_node_count, 1)
+        self.assertLessEqual(_device_voxel_count(initial_overflow_volume, "cpu"), 1)
+
         voxel_size = (0.25, 0.5, 1.0)
         translation = wp.vec3(-1.0, 2.0, -3.0)
         points_ws = np.array([[1, 2, 3], [4, 5, 6]], dtype=np.float32) * np.array(voxel_size) + np.array(translation)

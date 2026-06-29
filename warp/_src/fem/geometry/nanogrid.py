@@ -587,7 +587,8 @@ class Nanogrid(NanogridBase):
         Args:
             points: Flat ``wp.vec3i`` or ``wp.vec3f`` array of active voxel points.
                 Deprecated: a sequence of per-environment ``wp.vec3i`` arrays is also accepted for compatibility.
-            point_envs: Flat ``int32`` array with one environment index per point.
+            point_envs: Flat ``int32`` array with one environment index per point. Entries for unmasked points must
+                satisfy ``0 <= env < env_count``.
             env_count: Number of environments represented by ``point_envs``.
             env_offsets: Optional packed-grid offsets, one ``wp.vec3i`` per environment.
                 If omitted, offsets are generated along the x axis with at least one
@@ -736,7 +737,8 @@ class Nanogrid(NanogridBase):
             points: Active voxel points. When ``point_envs`` is provided, points are interpreted in local
                 environment space and packed through ``env_offsets`` before rebuilding the cell grid.
             point_envs: Optional ``int32`` array with one environment index per point. Required for
-                multi-environment Nanogrids.
+                multi-environment Nanogrids. Entries for unmasked points must satisfy
+                ``0 <= env < environment_count``.
             status: Optional one-element ``uint32`` array receiving rebuild status flags.
             point_mask: Optional ``int32`` array with one entry per point. Points with a zero mask value are ignored.
 
@@ -1359,8 +1361,15 @@ def _initialize_environment_bounds(
 
 
 @wp.func
+def _floor_environment_offset(x: int, alignment: int):
+    q = x // alignment
+    r = x - q * alignment
+    return wp.where(r < 0, q - 1, q) * alignment
+
+
+@wp.func
 def _align_environment_offset(x: int, alignment: int):
-    return ((x + alignment - 1) // alignment) * alignment
+    return -_floor_environment_offset(-x, alignment)
 
 
 @wp.func
@@ -1423,7 +1432,8 @@ def _compute_environment_spans(
     spans: wp.array(dtype=int),
 ):
     env = wp.tid()
-    span = wp.where(cell_counts[env] == 0, guard_cells, max_x[env] - min_x[env] + 1 + guard_cells)
+    packed_max_x = max_x[env] - _floor_environment_offset(min_x[env], alignment)
+    span = wp.where(cell_counts[env] == 0, guard_cells, packed_max_x + 1 + guard_cells)
     spans[env] = _align_environment_offset(span, alignment)
 
 
