@@ -178,6 +178,9 @@ class NanogridBSplineSpaceTopology(SpaceTopology):
         grid: Nanogrid,
         shape: CubeBSplineShapeFunctions,
     ):
+        if grid._rebuildable and shape.PADDING > 0:
+            raise NotImplementedError("Padded B-spline spaces are not supported for rebuildable Nanogrids")
+
         self._shape = shape
         super().__init__(grid, shape.NODES_PER_ELEMENT)
         self._grid = grid

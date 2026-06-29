@@ -757,6 +757,32 @@ def test_nanogrid_rebuild_capture_topology_lock(test, device):
     geo = fem.Nanogrid(volume, rebuildable=True)
 
     wp.load_module(device=device)
+
+    invalid_volume = wp.Volume.allocate_by_voxels(
+        points,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=1,
+        max_leaf_nodes=1,
+        max_lower_nodes=1,
+        max_upper_nodes=1,
+    )
+    unprepared_geo = fem.Nanogrid(invalid_volume, rebuildable=True)
+    invalid_points = wp.array([[0, 0]], dtype=wp.int32, device=device)
+
+    with wp.ScopedCapture(device=device, force_module_load=False):
+        with test.assertRaisesRegex(RuntimeError, "points must be contiguous"):
+            unprepared_geo.rebuild(invalid_points)
+
+    try:
+        unprepared_space = fem.make_polynomial_space(
+            unprepared_geo, degree=2, element_basis=fem.ElementBasis.SERENDIPITY
+        )
+    except RuntimeError as exc:
+        test.fail(f"Validation-only capture failure locked unprepared topology: {exc}")
+    test.assertEqual(unprepared_space.topology._edge_grid, unprepared_geo.edge_grid.id)
+
     with wp.ScopedCapture(device=device, force_module_load=False):
         with test.assertRaisesRegex(RuntimeError, "face topology"):
             geo.side_count()
@@ -823,6 +849,35 @@ def test_nanogrid_rebuild_face_topology(test, device):
 
     with test.assertRaisesRegex(NotImplementedError, "Face-noded spaces"):
         fem.make_polynomial_space(geo, degree=2)
+
+
+def test_nanogrid_rebuild_bspline_topology(test, device):
+    points = wp.array([[0, 0, 0]], dtype=wp.int32, device=device)
+    volume = wp.Volume.allocate_by_voxels(
+        points,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=1,
+        max_leaf_nodes=1,
+        max_lower_nodes=1,
+        max_upper_nodes=1,
+    )
+    geo = fem.Nanogrid(volume, rebuildable=True)
+
+    linear_space = fem.make_polynomial_space(geo, degree=1, element_basis=fem.ElementBasis.BSPLINE)
+    test.assertIs(linear_space.topology._padded_node_grid, geo.vertex_grid)
+    test.assertEqual(linear_space.node_count(), geo.vertex_count())
+
+    for degree in (2, 3):
+        with test.subTest(degree=degree):
+            with test.assertRaisesRegex(NotImplementedError, "B-spline.*rebuildable Nanogrids"):
+                fem.make_polynomial_space(geo, degree=degree, element_basis=fem.ElementBasis.BSPLINE)
+
+    fixed_volume = wp.Volume.allocate_by_voxels(points, voxel_size=1.0, device=device)
+    fixed_geo = fem.Nanogrid(fixed_volume)
+    quadratic_space = fem.make_polynomial_space(fixed_geo, degree=2, element_basis=fem.ElementBasis.BSPLINE)
+    test.assertGreater(quadratic_space.node_count(), fixed_geo.vertex_count())
 
 
 def test_nanogrid_guess_lookup_radius(test, device):
@@ -1152,6 +1207,12 @@ add_function_test(
 )
 add_function_test(
     TestFemGeometry, "test_nanogrid_rebuild_face_topology", test_nanogrid_rebuild_face_topology, devices=devices
+)
+add_function_test(
+    TestFemGeometry,
+    "test_nanogrid_rebuild_bspline_topology",
+    test_nanogrid_rebuild_bspline_topology,
+    devices=devices,
 )
 add_function_test(
     TestFemGeometry, "test_nanogrid_guess_lookup_radius", test_nanogrid_guess_lookup_radius, devices=cuda_devices

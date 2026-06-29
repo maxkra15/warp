@@ -765,7 +765,7 @@ class Nanogrid(NanogridBase):
         if not self._rebuildable:
             raise RuntimeError("Nanogrid was not constructed in rebuildable mode")
 
-        self._preflight_rebuildable_topology_capture()
+        self._check_rebuildable_topology_capture()
 
         points = _nanogrid_rebuild_points_array(points, self._cell_grid.device)
         point_count = points.shape[0]
@@ -1096,14 +1096,14 @@ class Nanogrid(NanogridBase):
                 raise RuntimeError("Rebuildable Nanogrid edge topology must be materialized before CUDA graph capture")
             self._build_edge_grid()
 
-    def _preflight_rebuildable_topology_capture(self):
-        if self._cell_grid.device.is_capturing:
-            if self._face_grid is not None:
-                raise RuntimeError("Rebuildable Nanogrid face topology cannot be refreshed during CUDA graph capture")
-            self._topology_capture_locked = True
+    def _check_rebuildable_topology_capture(self):
+        if self._cell_grid.device.is_capturing and self._face_grid is not None:
+            raise RuntimeError("Rebuildable Nanogrid face topology cannot be refreshed during CUDA graph capture")
 
     def _refresh_rebuildable_topology(self, status: wp.array | None = None, preserve_status: bool = False):
-        self._preflight_rebuildable_topology_capture()
+        self._check_rebuildable_topology_capture()
+        if self._cell_grid.device.is_capturing:
+            self._topology_capture_locked = True
 
         self._cell_grid.get_voxels(out=self._cell_ijk)
 
