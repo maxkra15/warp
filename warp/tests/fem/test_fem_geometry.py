@@ -571,6 +571,7 @@ def test_nanogrid_rebuild_capture(test, device):
 
 def test_nanogrid_rebuild_capture_topology_lock(test, device):
     points = wp.array([[0, 0, 0]], dtype=wp.int32, device=device)
+    two_points = wp.array([[0, 0, 0], [1, 0, 0]], dtype=wp.int32, device=device)
 
     volume = wp.Volume.allocate_by_voxels(
         points,
@@ -586,8 +587,12 @@ def test_nanogrid_rebuild_capture_topology_lock(test, device):
 
     wp.load_module(device=device)
     with wp.ScopedCapture(device=device, force_module_load=False):
+        with test.assertRaisesRegex(RuntimeError, "face topology"):
+            geo.side_count()
         geo.rebuild(points)
 
+    with test.assertRaisesRegex(RuntimeError, "face topology"):
+        geo.side_count()
     with test.assertRaisesRegex(RuntimeError, "before CUDA graph capture"):
         fem.make_polynomial_space(geo, degree=2, element_basis=fem.ElementBasis.SERENDIPITY)
 
@@ -596,14 +601,18 @@ def test_nanogrid_rebuild_capture_topology_lock(test, device):
         voxel_size=1.0,
         device=device,
         rebuildable=True,
-        max_active_voxels=1,
-        max_leaf_nodes=1,
-        max_lower_nodes=1,
-        max_upper_nodes=1,
+        max_active_voxels=2,
+        max_leaf_nodes=2,
+        max_lower_nodes=2,
+        max_upper_nodes=2,
     )
     geo_with_faces = fem.Nanogrid(volume_with_faces, rebuildable=True)
     face_count = geo_with_faces.side_count()
     capture_buffer = wp.zeros(1, dtype=wp.int32, device=device)
+    initial_vertex_count = geo_with_faces.vertex_grid.get_active_stats().voxel_count
+    initial_face_count = geo_with_faces.face_grid.get_active_stats().voxel_count
+
+    test.assertEqual(geo_with_faces.cell_grid.get_active_stats().voxel_count, 1)
 
     with wp.ScopedCapture(device=device, force_module_load=False):
         try:
@@ -613,9 +622,18 @@ def test_nanogrid_rebuild_capture_topology_lock(test, device):
         test.assertEqual(captured_face_count, face_count)
         capture_buffer.fill_(1)
 
+    capture = wp.ScopedCapture(device=device, force_module_load=False)
     with test.assertRaisesRegex(RuntimeError, "face topology"):
-        with wp.ScopedCapture(device=device, force_module_load=False):
-            geo_with_faces.rebuild(points)
+        with capture:
+            capture_buffer.fill_(2)
+            geo_with_faces.rebuild(two_points)
+
+    wp.capture_launch(capture.graph)
+    wp.synchronize_device(device)
+
+    test.assertEqual(geo_with_faces.cell_grid.get_active_stats().voxel_count, 1)
+    test.assertEqual(geo_with_faces.vertex_grid.get_active_stats().voxel_count, initial_vertex_count)
+    test.assertEqual(geo_with_faces.face_grid.get_active_stats().voxel_count, initial_face_count)
 
 
 def test_nanogrid_rebuild_face_topology(test, device):
