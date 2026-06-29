@@ -610,9 +610,10 @@ class Nanogrid(NanogridBase):
             scalar_type: Scalar type for grid coordinates (``wp.float32`` or ``wp.float64``).
             device: CUDA device on which to build the packed volume.
             rebuildable: Whether to allocate a cell grid with persistent rebuild capacity and retain capacity-sized
-                topology buffers for in-place refreshes. Auxiliary edge topology is allocated lazily by FEM space
-                construction. FEM spaces and their required topology must be materialized before CUDA graph capture;
-                only subsequent in-place topology refreshes are capture-safe.
+                topology buffers for in-place refreshes. Edge-noded FEM spaces used by captured rebuilds must be
+                constructed before capture because the first captured topology refresh locks the prepared topology
+                set, after which lazy topology materialization raises an error; face-noded FEM spaces remain
+                unsupported for rebuildable Nanogrids.
             max_active_voxels: Maximum number of active voxels for rebuilds. Defaults to the packed cell count.
             max_leaf_nodes: Maximum number of NanoVDB leaf nodes for rebuilds. Defaults to ``max_active_voxels``.
             max_lower_nodes: Maximum number of lower internal nodes for rebuilds. Defaults to ``max_leaf_nodes``.
@@ -679,9 +680,10 @@ class Nanogrid(NanogridBase):
             temporary_store: shared pool from which to allocate temporary arrays
             scalar_type: Scalar type for grid coordinates (``wp.float32`` or ``wp.float64``)
             rebuildable: Whether to retain capacity-sized topology buffers that can be refreshed with
-                :meth:`rebuild_topology_from_cells`. Auxiliary edge topology required by a FEM space is allocated
-                lazily when the space is constructed. FEM spaces and their required topology must be materialized before
-                CUDA graph capture; only subsequent in-place topology refreshes are capture-safe.
+                :meth:`rebuild_topology_from_cells`. Edge-noded FEM spaces used by captured rebuilds must be constructed
+                before capture because the first captured topology refresh locks the prepared topology set, after which
+                lazy topology materialization raises an error; face-noded FEM spaces remain unsupported for rebuildable
+                Nanogrids.
         """
 
         self._cell_grid = grid
@@ -752,7 +754,8 @@ class Nanogrid(NanogridBase):
             point_envs: Optional ``int32`` array with one environment index per point. Required for
                 multi-environment Nanogrids. Entries for unmasked points must satisfy
                 ``0 <= env < environment_count``.
-            status: Optional one-element ``uint32`` array receiving rebuild status flags.
+            status: Optional one-element ``uint32`` array receiving the union of raw cell-grid and prepared auxiliary
+                topology ``Volume.REBUILD_*`` flags.
             point_mask: Optional ``int32`` array with one entry per point. Points with a zero mask value are ignored.
 
         Returns:
@@ -802,11 +805,12 @@ class Nanogrid(NanogridBase):
     def rebuild_topology_from_cells(self, status: wp.array | None = None):
         """Refresh Nanogrid topology buffers from the current cell grid.
 
-        During CUDA graph capture, use :meth:`rebuild` instead of rebuilding the underlying Volume separately when
-        face state may exist, because only :meth:`rebuild` can preflight before Volume work is recorded.
+        During CUDA graph capture, use :meth:`rebuild` if face topology may be materialized; rebuilding the underlying
+        :class:`warp.Volume` directly records its work before this method can preflight topology.
 
         Args:
-            status: Optional one-element ``uint32`` array receiving rebuild status flags from auxiliary topology.
+            status: Optional one-element ``uint32`` array receiving the union of vertex and prepared edge topology
+                ``Volume.REBUILD_*`` flags.
         """
 
         if not self._rebuildable:
