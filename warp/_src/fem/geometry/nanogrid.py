@@ -805,8 +805,8 @@ class Nanogrid(NanogridBase):
     def rebuild_topology_from_cells(self, status: wp.array | None = None):
         """Refresh Nanogrid topology buffers from the current cell grid.
 
-        During CUDA graph capture, use :meth:`rebuild` if face topology may be materialized; rebuilding the underlying
-        :class:`warp.Volume` directly records its work before this method can preflight topology.
+        During CUDA graph capture, use :meth:`rebuild` if dynamic geometry face topology may already have been
+        materialized, because it preflights topology before work on the underlying :class:`warp.Volume` is recorded.
 
         Args:
             status: Optional one-element ``uint32`` array receiving the union of vertex and prepared edge topology
