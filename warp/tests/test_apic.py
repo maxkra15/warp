@@ -1638,6 +1638,32 @@ def test_borrow_temporary_not_recycled_during_apic_capture(test, device):
     test.assertEqual(t1.ptr, ptr1, "captured temporary was released mid-capture")
 
 
+def test_borrow_temporary_bypasses_pool_during_cuda_capture(test, device):
+    """Native CUDA captures must not borrow graph scratch from a recycling pool."""
+    from warp._src.fem import cache as fem_cache  # noqa: PLC0415
+
+    store = fem_cache.TemporaryStore()
+    pooled = fem_cache.borrow_temporary(store, shape=(64,), dtype=wp.float32, device=device)
+    pooled_ptr = pooled.ptr
+    pooled.release()
+
+    with wp.ScopedCapture(device=device, force_module_load=False) as capture:
+        captured = fem_cache.borrow_temporary(store, shape=(64,), dtype=wp.float32, device=device)
+        captured_ptr = captured.ptr
+        captured.fill_(1.0)
+        captured.release()
+
+    test.assertIsNotNone(capture.graph)
+    borrowed_after_capture = fem_cache.borrow_temporary(store, shape=(64,), dtype=wp.float32, device=device)
+
+    test.assertNotEqual(
+        borrowed_after_capture.ptr,
+        captured_ptr,
+        "captured temporary pointer was reissued by the recycling pool",
+    )
+    test.assertEqual(borrowed_after_capture.ptr, pooled_ptr)
+
+
 @wp.kernel
 def saxpy_kernel(a: wp.array(dtype=float), b: wp.array(dtype=float), s: float, out: wp.array(dtype=float)):
     i = wp.tid()
@@ -2263,6 +2289,12 @@ add_function_test(
     "test_borrow_temporary_not_recycled_during_apic_capture",
     test_borrow_temporary_not_recycled_during_apic_capture,
     devices=[d for d in devices if d.is_cpu],
+)
+add_function_test(
+    TestApic,
+    "test_borrow_temporary_bypasses_pool_during_cuda_capture",
+    test_borrow_temporary_bypasses_pool_during_cuda_capture,
+    devices=[d for d in devices_with_graph_capture_allocation if d.is_cuda],
 )
 add_function_test(
     TestApic,

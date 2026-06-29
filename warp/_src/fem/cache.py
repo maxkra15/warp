@@ -659,17 +659,17 @@ def borrow_temporary(
 
     from warp._src.context import runtime  # noqa: PLC0415
 
+    device = wp.get_device(device)
+
     if temporary_store is None:
         temporary_store = TemporaryStore._default_store
 
-    # During APIC graph capture, bypass the recycling pool. The captured byte
-    # stream references buffers by pointer, so a borrowed temporary must not be
-    # handed back to a later borrow. A non-pool array -- its own allocator
-    # deleter, never entered into Pool._allocs -- is never re-issued; track_array()
-    # retains it via the capture's _regions for the graph's lifetime, and
-    # release()/detach() are suppressed while a capture is active (see
-    # _release_temporary).
-    if temporary_store is None or runtime._apic_capture is not None:
+    # During graph capture, bypass the recycling pool. Captured operations keep
+    # buffer pointers, so returning one to the pool could let a later borrower
+    # alias graph scratch. Keep the global APIC guard because a CUDA APIC capture
+    # may also track CPU/pinned helper buffers; Device.is_capturing additionally
+    # covers native CUDA capture on the resolved allocation device.
+    if temporary_store is None or runtime._apic_capture is not None or device.is_capturing:
         return TemporaryStore.add_temporary_convenience_methods(
             Temporary(shape=shape, dtype=dtype, pinned=pinned, device=device, requires_grad=requires_grad)
         )

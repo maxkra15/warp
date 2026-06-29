@@ -1,6 +1,6 @@
 # Capture-Safe Environment-First Space Partitions
 
-**Status**: Proposed
+**Status**: Implemented
 
 **Issue**: [GH-1407](https://github.com/NVIDIA/warp/issues/1407)
 
@@ -142,6 +142,13 @@ array pointers while Python attribute assignment is not replayed. Structural
 changes may replace arrays outside capture. When `_space_to_partition` is
 replaced, the cached `partition_arg_value` must be invalidated so subsequent
 launches cannot retain a stale mapping pointer.
+
+FEM temporaries borrowed while either APIC or native CUDA graph capture is
+active bypass `TemporaryStore`'s recycling pools. Capture-local allocations are
+therefore owned by the captured graph or APIC recording rather than being made
+available to an unrelated borrower while the graph still retains their
+pointers. Persistent partition outputs remain owned by the partition object and
+are reused in place.
 
 The rebuild documentation will state that changing topology size, environment
 count, device, or capacity is structural and is not supported inside an already
