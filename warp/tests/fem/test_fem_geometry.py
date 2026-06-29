@@ -369,9 +369,12 @@ def test_nanogrid(test, device):
 
 
 @wp.kernel
-def _nanogrid_volume_counts(cell_grid: wp.uint64, vertex_grid: wp.uint64, counts: wp.array(dtype=wp.int32)):
+def _nanogrid_volume_counts(
+    cell_grid: wp.uint64, vertex_grid: wp.uint64, edge_grid: wp.uint64, counts: wp.array(dtype=wp.int32)
+):
     counts[0] = wp.volume_voxel_count(cell_grid)
     counts[1] = wp.volume_voxel_count(vertex_grid)
+    counts[2] = wp.volume_voxel_count(edge_grid)
 
 
 def test_nanogrid_rebuild(test, device):
@@ -379,7 +382,7 @@ def test_nanogrid_rebuild(test, device):
     points_rebuild = wp.array([[0, 0, 0], [1, 0, 0], [1, 0, 0], [3, 0, 0], [4, 0, 0]], dtype=wp.int32, device=device)
     point_mask = wp.array([1, 1, 0, 1, 0], dtype=wp.int32, device=device)
     status = wp.zeros(1, dtype=wp.uint32, device=device)
-    counts = wp.empty(2, dtype=wp.int32, device=device)
+    counts = wp.empty(3, dtype=wp.int32, device=device)
 
     volume = wp.Volume.allocate_by_voxels(
         points_initial,
@@ -404,13 +407,18 @@ def test_nanogrid_rebuild(test, device):
     geo = fem.Nanogrid(volume, rebuildable=True)
 
     geo.rebuild(points_rebuild, status=status, point_mask=point_mask)
-    wp.launch(_nanogrid_volume_counts, dim=1, inputs=[geo.cell_grid.id, geo.vertex_grid.id, counts], device=device)
+    wp.launch(
+        _nanogrid_volume_counts,
+        dim=1,
+        inputs=[geo.cell_grid.id, geo.vertex_grid.id, geo.edge_grid.id, counts],
+        device=device,
+    )
     wp.synchronize_device(device)
 
     test.assertEqual(int(status.numpy()[0]), wp.Volume.REBUILD_SUCCESS)
     test.assertEqual(geo.cell_count(), 4)
     test.assertEqual(geo.vertex_count(), 32)
-    np.testing.assert_array_equal(counts.numpy(), np.array([3, 20]))
+    np.testing.assert_array_equal(counts.numpy(), np.array([3, 20, 32]))
 
     env_offsets = wp.array([[0, 0, 0], [5, 0, 0]], dtype=wp.vec3i, device=device)
     env_initial = wp.array([[0, 0, 0], [5, 0, 0]], dtype=wp.int32, device=device)
@@ -462,7 +470,7 @@ def test_nanogrid_rebuild_capture(test, device):
     points_rebuild = wp.array([[0, 0, 0], [1, 0, 0], [1, 0, 0], [3, 0, 0], [4, 0, 0]], dtype=wp.int32, device=device)
     point_mask = wp.array([1, 1, 0, 1, 0], dtype=wp.int32, device=device)
     status = wp.zeros(1, dtype=wp.uint32, device=device)
-    counts = wp.empty(2, dtype=wp.int32, device=device)
+    counts = wp.empty(3, dtype=wp.int32, device=device)
 
     volume = wp.Volume.allocate_by_voxels(
         points_initial,
@@ -476,30 +484,45 @@ def test_nanogrid_rebuild_capture(test, device):
         status=status,
     )
     geo = fem.Nanogrid(volume, rebuildable=True)
-    space = fem.make_polynomial_space(geo, degree=1)
+    space = fem.make_polynomial_space(geo, degree=2, element_basis=fem.ElementBasis.SERENDIPITY)
     vertex_grid_id = geo.vertex_grid.id
+    # Keep the initial edge grid alive so capture must rebuild it in place for the S2 topology.
+    edge_grid = geo.edge_grid
 
     test.assertEqual(geo.cell_count(), 4)
     test.assertEqual(geo.vertex_count(), 32)
     test.assertEqual(space.topology._vertex_grid, vertex_grid_id)
+    test.assertEqual(space.topology._edge_grid, edge_grid.id)
 
-    wp.launch(_nanogrid_volume_counts, dim=1, inputs=[geo.cell_grid.id, geo.vertex_grid.id, counts], device=device)
+    wp.launch(
+        _nanogrid_volume_counts,
+        dim=1,
+        inputs=[geo.cell_grid.id, geo.vertex_grid.id, edge_grid.id, counts],
+        device=device,
+    )
     wp.synchronize_device(device)
-    np.testing.assert_array_equal(counts.numpy(), np.array([1, 8]))
+    np.testing.assert_array_equal(counts.numpy(), np.array([1, 8, 12]))
 
     wp.load_module(device=device)
     with wp.ScopedCapture(device=device, force_module_load=False) as capture:
         volume.rebuild(points_rebuild, status=status, point_mask=point_mask)
         geo.rebuild_topology_from_cells()
-        wp.launch(_nanogrid_volume_counts, dim=1, inputs=[geo.cell_grid.id, geo.vertex_grid.id, counts], device=device)
+        wp.launch(
+            _nanogrid_volume_counts,
+            dim=1,
+            inputs=[geo.cell_grid.id, geo.vertex_grid.id, edge_grid.id, counts],
+            device=device,
+        )
 
     wp.capture_launch(capture.graph)
     wp.synchronize_device(device)
 
     test.assertEqual(int(status.numpy()[0]), wp.Volume.REBUILD_SUCCESS)
     test.assertEqual(geo.vertex_grid.id, vertex_grid_id)
+    test.assertIs(geo.edge_grid, edge_grid)
     test.assertEqual(space.topology._vertex_grid, geo.vertex_grid.id)
-    np.testing.assert_array_equal(counts.numpy(), np.array([3, 20]))
+    test.assertEqual(space.topology._edge_grid, edge_grid.id)
+    np.testing.assert_array_equal(counts.numpy(), np.array([3, 20, 32]))
 
     cell_mask = wp.zeros(geo.cell_count(), dtype=int, device=device)
     cell_mask[:3].fill_(1)
