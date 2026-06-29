@@ -48,6 +48,9 @@ volume_get_voxel_coords(const uint32_t voxel_count, pnanovdb_coord_t* voxel_coor
 
 void launch_get_leaf_coords(void* context, const uint32_t leaf_count, pnanovdb_coord_t* leaf_coords, pnanovdb_buf_t buf)
 {
+    if (leaf_count == 0)
+        return;
+
     ContextGuard guard(context);
     wp_launch_device(WP_CURRENT_CONTEXT, volume_get_leaf_coords, leaf_count, (leaf_count, leaf_coords, buf));
 }
@@ -60,6 +63,9 @@ void launch_get_voxel_coords(
     pnanovdb_buf_t buf
 )
 {
+    if (leaf_count == 0 || voxel_count == 0)
+        return;
+
     ContextGuard guard(context);
     cudaStream_t stream = (cudaStream_t)wp_cuda_stream_get_current();
     volume_get_voxel_coords<<<leaf_count, dim3(8, 8, 8), 0, stream>>>(voxel_count, voxel_coords, buf);

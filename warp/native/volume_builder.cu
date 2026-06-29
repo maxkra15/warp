@@ -745,11 +745,14 @@ __global__ void rebuild_propagate_upper_bboxes(RebuildGridData data)
 
 __global__ void rebuild_finalize_world_bbox(RebuildGridData data)
 {
-    const pnanovdb_root_handle_t root = data.getRoot();
-    const pnanovdb_coord_t root_min = pnanovdb_root_get_bbox_min(data.buf, root);
-    const pnanovdb_coord_t root_max = pnanovdb_root_get_bbox_max(data.buf, root);
-    const nanovdb::CoordBBox index_bbox(rebuild_make_coord(root_min), rebuild_make_coord(root_max));
-    const nanovdb::Vec3dBBox world_bbox = index_bbox.transform(data.map);
+    nanovdb::Vec3dBBox world_bbox;
+    if (data.counts[REBUILD_COUNT_UPPER] > 0) {
+        const pnanovdb_root_handle_t root = data.getRoot();
+        const pnanovdb_coord_t root_min = pnanovdb_root_get_bbox_min(data.buf, root);
+        const pnanovdb_coord_t root_max = pnanovdb_root_get_bbox_max(data.buf, root);
+        const nanovdb::CoordBBox index_bbox(rebuild_make_coord(root_min), rebuild_make_coord(root_max));
+        world_bbox = index_bbox.transform(data.map);
+    }
     const pnanovdb_grid_handle_t grid = data.getGrid();
     pnanovdb_grid_set_world_bbox(data.buf, grid, 0u, world_bbox[0][0]);
     pnanovdb_grid_set_world_bbox(data.buf, grid, 1u, world_bbox[0][1]);
@@ -926,7 +929,7 @@ void rebuild_populate_grid_from_scratch(
 {
     uint32_t* leaf_active_counts = nullptr;
     uint64_t* leaf_active_prefix = nullptr;
-    if (scratch.active_voxel_grid) {
+    if (scratch.active_voxel_grid && capacities.leaf_count > 0) {
         leaf_active_counts = static_cast<uint32_t*>(
             wp_alloc_device(WP_CURRENT_CONTEXT, capacities.leaf_count * sizeof(uint32_t), "(native:volume_builder)")
         );
@@ -942,38 +945,56 @@ void rebuild_populate_grid_from_scratch(
     );
 
     rebuild_init_grid_tree_root<<<1, 1, 0, stream>>>(data);
-    rebuild_build_upper_nodes<<<rebuild_num_blocks(capacities.upper_count), REBUILD_NUM_THREADS, 0, stream>>>(data);
-    rebuild_set_upper_background_values<<<
-        rebuild_num_blocks(uint64_t(capacities.upper_count) << 15u), REBUILD_NUM_THREADS, 0, stream>>>(data);
-    rebuild_build_lower_nodes<<<rebuild_num_blocks(capacities.lower_count), REBUILD_NUM_THREADS, 0, stream>>>(data);
-    rebuild_set_lower_background_values<<<
-        rebuild_num_blocks(uint64_t(capacities.lower_count) << 12u), REBUILD_NUM_THREADS, 0, stream>>>(data);
-    rebuild_build_leaf_nodes<<<rebuild_num_blocks(capacities.leaf_count), REBUILD_NUM_THREADS, 0, stream>>>(
-        data, scratch.active_voxel_grid
-    );
+    if (capacities.upper_count > 0) {
+        rebuild_build_upper_nodes<<<rebuild_num_blocks(capacities.upper_count), REBUILD_NUM_THREADS, 0, stream>>>(data);
+        rebuild_set_upper_background_values<<<
+            rebuild_num_blocks(uint64_t(capacities.upper_count) << 15u), REBUILD_NUM_THREADS, 0, stream>>>(data);
+    }
+    if (capacities.lower_count > 0) {
+        rebuild_build_lower_nodes<<<rebuild_num_blocks(capacities.lower_count), REBUILD_NUM_THREADS, 0, stream>>>(data);
+        rebuild_set_lower_background_values<<<
+            rebuild_num_blocks(uint64_t(capacities.lower_count) << 12u), REBUILD_NUM_THREADS, 0, stream>>>(data);
+    }
+    if (capacities.leaf_count > 0) {
+        rebuild_build_leaf_nodes<<<rebuild_num_blocks(capacities.leaf_count), REBUILD_NUM_THREADS, 0, stream>>>(
+            data, scratch.active_voxel_grid
+        );
+    }
     check_cuda(cudaGetLastError());
 
-    if (scratch.active_voxel_grid && data.grid_type == PNANOVDB_GRID_TYPE_ONINDEX) {
-        rebuild_set_active_voxels<<<rebuild_num_blocks(capacities.voxel_count), REBUILD_NUM_THREADS, 0, stream>>>(data);
+    if (scratch.active_voxel_grid && data.grid_type == PNANOVDB_GRID_TYPE_ONINDEX && capacities.leaf_count > 0) {
+        if (capacities.voxel_count > 0) {
+            rebuild_set_active_voxels<<<rebuild_num_blocks(capacities.voxel_count), REBUILD_NUM_THREADS, 0, stream>>>(
+                data
+            );
+        }
         rebuild_exclusive_sum_u32_to_u64(leaf_active_counts, leaf_active_prefix, int(capacities.leaf_count), stream);
         rebuild_finalize_onindex_leaves<<<rebuild_num_blocks(capacities.leaf_count), REBUILD_NUM_THREADS, 0, stream>>>(
             data
         );
-    } else {
+    } else if (capacities.leaf_count > 0) {
         rebuild_set_leaf_values<<<
             rebuild_num_blocks(uint64_t(capacities.leaf_count) << 9u), REBUILD_NUM_THREADS, 0, stream>>>(data);
     }
 
     const uint32_t bbox_capacity
         = std::max(std::max(capacities.leaf_count, capacities.lower_count), capacities.upper_count);
-    rebuild_reset_bboxes<<<rebuild_num_blocks(bbox_capacity), REBUILD_NUM_THREADS, 0, stream>>>(data);
-    rebuild_propagate_leaf_bboxes<<<rebuild_num_blocks(capacities.leaf_count), REBUILD_NUM_THREADS, 0, stream>>>(data);
-    rebuild_propagate_lower_bboxes<<<rebuild_num_blocks(capacities.lower_count), REBUILD_NUM_THREADS, 0, stream>>>(
-        data
-    );
-    rebuild_propagate_upper_bboxes<<<rebuild_num_blocks(capacities.upper_count), REBUILD_NUM_THREADS, 0, stream>>>(
-        data
-    );
+    rebuild_reset_bboxes<<<rebuild_num_blocks(std::max(1u, bbox_capacity)), REBUILD_NUM_THREADS, 0, stream>>>(data);
+    if (capacities.leaf_count > 0) {
+        rebuild_propagate_leaf_bboxes<<<rebuild_num_blocks(capacities.leaf_count), REBUILD_NUM_THREADS, 0, stream>>>(
+            data
+        );
+    }
+    if (capacities.lower_count > 0) {
+        rebuild_propagate_lower_bboxes<<<rebuild_num_blocks(capacities.lower_count), REBUILD_NUM_THREADS, 0, stream>>>(
+            data
+        );
+    }
+    if (capacities.upper_count > 0) {
+        rebuild_propagate_upper_bboxes<<<rebuild_num_blocks(capacities.upper_count), REBUILD_NUM_THREADS, 0, stream>>>(
+            data
+        );
+    }
     rebuild_finalize_world_bbox<<<1, 1, 0, stream>>>(data);
     check_cuda(cudaGetLastError());
 
@@ -1042,11 +1063,6 @@ void allocate_exact_grid_from_points_impl(
     }
 
     const VolumeRebuildCapacities capacities = rebuild_copy_exact_capacities(scratch, stream);
-    if (capacities.leaf_count == 0 || capacities.lower_count == 0 || capacities.upper_count == 0) {
-        rebuild_free_key_scratch(scratch);
-        return;
-    }
-
     out_grid_size = rebuildable_grid_size<BuildT>(capacities);
     out_grid = static_cast<nanovdb::Grid<nanovdb::NanoTree<BuildT>>*>(
         wp_alloc_device(WP_CURRENT_CONTEXT, out_grid_size, "(native:volume_builder)")

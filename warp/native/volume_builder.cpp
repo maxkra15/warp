@@ -94,7 +94,7 @@ bool rebuild_count_points(
         keys.push_back(rebuild_upper_key_from_coord(rebuild_point_to_coord(points, i, points_in_world_space, map)));
     }
     if (keys.empty()) {
-        return false;
+        return true;
     }
     scratch.upper_keys = keys;
     rebuild_sort_unique(scratch.upper_keys);
@@ -521,20 +521,23 @@ void rebuild_propagate_upper_bboxes(HostRebuildGridData& data)
 void rebuild_finalize_world_bbox(HostRebuildGridData& data)
 {
     const pnanovdb_grid_handle_t grid = data.getGrid();
-    const pnanovdb_root_handle_t root = data.getRoot();
-    const pnanovdb_coord_t root_min = pnanovdb_root_get_bbox_min(data.buf, root);
-    const pnanovdb_coord_t root_max = pnanovdb_root_get_bbox_max(data.buf, root);
+    nanovdb::Vec3dBBox world_bbox;
+    if (data.scratch->counts[REBUILD_COUNT_UPPER] > 0) {
+        const pnanovdb_root_handle_t root = data.getRoot();
+        const pnanovdb_coord_t root_min = pnanovdb_root_get_bbox_min(data.buf, root);
+        const pnanovdb_coord_t root_max = pnanovdb_root_get_bbox_max(data.buf, root);
 
-    const nanovdb::Vec3d index_min(root_min.x, root_min.y, root_min.z);
-    const nanovdb::Vec3d index_max(root_max.x + 1.0, root_max.y + 1.0, root_max.z + 1.0);
-    nanovdb::Vec3dBBox world_bbox(data.map.applyMap(index_min), data.map.applyMap(index_min));
-    world_bbox.expand(data.map.applyMap(nanovdb::Vec3d(index_min[0], index_min[1], index_max[2])));
-    world_bbox.expand(data.map.applyMap(nanovdb::Vec3d(index_min[0], index_max[1], index_min[2])));
-    world_bbox.expand(data.map.applyMap(nanovdb::Vec3d(index_max[0], index_min[1], index_min[2])));
-    world_bbox.expand(data.map.applyMap(nanovdb::Vec3d(index_max[0], index_max[1], index_min[2])));
-    world_bbox.expand(data.map.applyMap(nanovdb::Vec3d(index_max[0], index_min[1], index_max[2])));
-    world_bbox.expand(data.map.applyMap(nanovdb::Vec3d(index_min[0], index_max[1], index_max[2])));
-    world_bbox.expand(data.map.applyMap(index_max));
+        const nanovdb::Vec3d index_min(root_min.x, root_min.y, root_min.z);
+        const nanovdb::Vec3d index_max(root_max.x + 1.0, root_max.y + 1.0, root_max.z + 1.0);
+        world_bbox = nanovdb::Vec3dBBox(data.map.applyMap(index_min), data.map.applyMap(index_min));
+        world_bbox.expand(data.map.applyMap(nanovdb::Vec3d(index_min[0], index_min[1], index_max[2])));
+        world_bbox.expand(data.map.applyMap(nanovdb::Vec3d(index_min[0], index_max[1], index_min[2])));
+        world_bbox.expand(data.map.applyMap(nanovdb::Vec3d(index_max[0], index_min[1], index_min[2])));
+        world_bbox.expand(data.map.applyMap(nanovdb::Vec3d(index_max[0], index_max[1], index_min[2])));
+        world_bbox.expand(data.map.applyMap(nanovdb::Vec3d(index_max[0], index_min[1], index_max[2])));
+        world_bbox.expand(data.map.applyMap(nanovdb::Vec3d(index_min[0], index_max[1], index_max[2])));
+        world_bbox.expand(data.map.applyMap(index_max));
+    }
     pnanovdb_grid_set_world_bbox(data.buf, grid, 0u, world_bbox[0][0]);
     pnanovdb_grid_set_world_bbox(data.buf, grid, 1u, world_bbox[0][1]);
     pnanovdb_grid_set_world_bbox(data.buf, grid, 2u, world_bbox[0][2]);

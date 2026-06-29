@@ -75,8 +75,8 @@ class AdaptiveNanogrid(NanogridBase):
     @classmethod
     def from_environment_voxels(
         cls,
-        points: wp.array | Sequence[wp.array],
-        cell_levels: wp.array | Sequence[wp.array],
+        points: wp.array | Sequence[wp.array] | None = None,
+        cell_levels: wp.array | Sequence[wp.array] | None = None,
         point_envs: wp.array | int | None = None,
         env_count: int | wp.array | Sequence[Sequence[int]] | None = None,
         level_count: int | None = None,
@@ -89,6 +89,7 @@ class AdaptiveNanogrid(NanogridBase):
         temporary_store: cache.TemporaryStore | None = None,
         scalar_type: type = wp.float32,
         device=None,
+        cell_ijks: Sequence[wp.array] | None = None,
     ):
         """Construct an adaptive sparse grid from environment-tagged active cells and levels.
 
@@ -121,7 +122,17 @@ class AdaptiveNanogrid(NanogridBase):
             temporary_store: Shared pool from which to allocate temporary arrays.
             scalar_type: Scalar type for grid coordinates (``wp.float32`` or ``wp.float64``).
             device: CUDA device on which to build the packed volume.
+            cell_ijks: Deprecated keyword alias for the old per-environment ``points`` sequence form.
         """
+
+        if cell_ijks is not None:
+            if points is not None:
+                raise TypeError("points and cell_ijks cannot both be provided")
+            points = cell_ijks
+        if points is None:
+            raise TypeError("points is required")
+        if cell_levels is None:
+            raise TypeError("cell_levels is required")
 
         if not isinstance(points, wp.array):
             points, cell_levels, point_envs, env_count, level_count, env_offsets = (

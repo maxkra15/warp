@@ -641,6 +641,51 @@ def test_volume_point_mask(test, device):
     np.testing.assert_array_equal(_sort_rows(tile_volume.get_tiles().numpy()), expected_tiles)
     test.assertEqual(_device_voxel_count(tile_volume, device), expected_tiles.shape[0] * 512)
 
+    _check_all_masked_volumes(test, device)
+
+
+def _check_all_masked_volumes(test, device):
+    points = wp.array([[0, 0, 0], [8, 0, 0]], dtype=wp.int32, device=device)
+    all_masked = wp.zeros(points.shape[0], dtype=wp.int32, device=device)
+
+    exact_voxel_volume = wp.Volume.allocate_by_voxels(points, voxel_size=1.0, device=device, point_mask=all_masked)
+    test.assertEqual(exact_voxel_volume.get_active_stats(), wp.Volume.ActiveStats(0, 0, 0, 0))
+    test.assertEqual(exact_voxel_volume.get_voxels().shape[0], 0)
+    test.assertEqual(_device_voxel_count(exact_voxel_volume, device), 0)
+
+    exact_tile_volume = wp.Volume.allocate_by_tiles(
+        points, voxel_size=1.0, bg_value=1.0, device=device, point_mask=all_masked
+    )
+    test.assertEqual(exact_tile_volume.get_active_stats(), wp.Volume.ActiveStats(0, 0, 0, 0))
+    test.assertEqual(exact_tile_volume.get_tiles().shape[0], 0)
+    test.assertEqual(_device_voxel_count(exact_tile_volume, device), 0)
+
+    status = wp.zeros(1, dtype=wp.uint32, device=device)
+    rebuildable_volume = wp.Volume.allocate_by_voxels(
+        points,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=2,
+        max_leaf_nodes=2,
+        max_lower_nodes=2,
+        max_upper_nodes=2,
+        status=status,
+        point_mask=all_masked,
+    )
+    test.assertEqual(int(status.numpy()[0]), wp.Volume.REBUILD_SUCCESS)
+    test.assertEqual(rebuildable_volume.get_active_stats(), wp.Volume.ActiveStats(0, 0, 0, 0))
+    test.assertEqual(_device_voxel_count(rebuildable_volume, device), 0)
+
+    rebuildable_volume.rebuild(points, status=status)
+    test.assertEqual(int(status.numpy()[0]), wp.Volume.REBUILD_SUCCESS)
+    test.assertEqual(rebuildable_volume.get_active_stats().voxel_count, 2)
+
+    rebuildable_volume.rebuild(points, status=status, point_mask=all_masked)
+    test.assertEqual(int(status.numpy()[0]), wp.Volume.REBUILD_SUCCESS)
+    test.assertEqual(rebuildable_volume.get_active_stats(), wp.Volume.ActiveStats(0, 0, 0, 0))
+    test.assertEqual(_device_voxel_count(rebuildable_volume, device), 0)
+
 
 def test_volume_voxel_count(test, device):
     points_np = np.array([[0, 0, 0], [1, 2, 3], [1, 2, 3], [4, 5, 6]], dtype=np.int32)
@@ -1184,6 +1229,8 @@ class TestVolumeWrite(unittest.TestCase):
         )
         self.assertEqual(tile_volume.get_voxel_count(), expected_tiles.shape[0] * 512)
         np.testing.assert_array_equal(_sort_rows(tile_volume.get_tiles().numpy()), expected_tiles)
+
+        _check_all_masked_volumes(self, "cpu")
 
     def test_volume_rebuildable_cpu(self):
         initial_tiles = wp.array([[0, 0, 0]], dtype=wp.int32, device="cpu")
