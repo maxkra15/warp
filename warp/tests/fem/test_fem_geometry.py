@@ -465,6 +465,36 @@ def test_nanogrid_rebuild(test, device):
     test.assertEqual(env_by_voxel[(6, 0, 0)], 1)
 
 
+def test_nanogrid_rebuild_edge_capacity(test, device):
+    cell_ijk = wp.array(
+        np.stack(
+            np.meshgrid(np.arange(8), np.arange(8), np.arange(8), indexing="ij"),
+            axis=-1,
+        ).reshape(-1, 3),
+        dtype=wp.int32,
+        device=device,
+    )
+    volume = wp.Volume.allocate_by_voxels(
+        cell_ijk,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=cell_ijk.shape[0],
+        max_leaf_nodes=1,
+        max_lower_nodes=1,
+        max_upper_nodes=1,
+    )
+    geo = fem.Nanogrid(volume, rebuildable=True)
+    edge_grid = geo.edge_grid
+    active = edge_grid.get_active_stats()
+    capacity = edge_grid.get_rebuild_info()
+
+    test.assertTrue(edge_grid.is_rebuildable)
+    test.assertEqual(active.voxel_count, 3 * 8 * 9 * 9)
+    test.assertEqual(active.leaf_node_count, 12)
+    test.assertGreaterEqual(capacity.max_leaf_node_count, active.leaf_node_count)
+
+
 def test_nanogrid_rebuild_capture(test, device):
     points_initial = wp.array([[0, 0, 0]], dtype=wp.int32, device=device)
     points_rebuild = wp.array([[0, 0, 0], [1, 0, 0], [1, 0, 0], [3, 0, 0], [4, 0, 0]], dtype=wp.int32, device=device)
@@ -843,6 +873,9 @@ add_function_test(TestFemGeometry, "test_tet_mesh", test_tet_mesh, devices=devic
 add_function_test(TestFemGeometry, "test_hex_mesh", test_hex_mesh, devices=devices)
 add_function_test(TestFemGeometry, "test_nanogrid", test_nanogrid, devices=cuda_devices)
 add_function_test(TestFemGeometry, "test_nanogrid_rebuild", test_nanogrid_rebuild, devices=devices)
+add_function_test(
+    TestFemGeometry, "test_nanogrid_rebuild_edge_capacity", test_nanogrid_rebuild_edge_capacity, devices=cuda_devices
+)
 add_function_test(TestFemGeometry, "test_nanogrid_rebuild_capture", test_nanogrid_rebuild_capture, devices=cuda_devices)
 add_function_test(
     TestFemGeometry, "test_nanogrid_guess_lookup_radius", test_nanogrid_guess_lookup_radius, devices=cuda_devices
