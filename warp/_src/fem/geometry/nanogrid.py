@@ -719,6 +719,7 @@ class Nanogrid(NanogridBase):
         )
 
         self._rebuildable = rebuildable
+        self._topology_capture_locked = False
         self._node_candidates = node_candidates
         self._node_candidate_mask = node_candidate_mask
 
@@ -1055,6 +1056,11 @@ class Nanogrid(NanogridBase):
         boundary_face_mask.release()
         self._boundary_face_indices = boundary_face_indices.detach()
 
+    def _ensure_face_grid(self):
+        if self._rebuildable and (self._cell_grid.device.is_capturing or self._topology_capture_locked):
+            raise RuntimeError("Rebuildable Nanogrid face topology is not supported during or after CUDA graph capture")
+        super()._ensure_face_grid()
+
     def _build_edge_grid(self, temporary_store: cache.TemporaryStore | None = None):
         if self._rebuildable:
             self._edge_grid, self._edge_candidates, self._edge_candidate_mask = _build_rebuildable_edge_grid(
@@ -1067,9 +1073,16 @@ class Nanogrid(NanogridBase):
 
     def _ensure_edge_grid(self):
         if self._edge_grid is None:
+            if self._rebuildable and (self._cell_grid.device.is_capturing or self._topology_capture_locked):
+                raise RuntimeError("Rebuildable Nanogrid edge topology must be materialized before CUDA graph capture")
             self._build_edge_grid()
 
     def _refresh_rebuildable_topology(self):
+        if self._cell_grid.device.is_capturing:
+            if self._face_grid is not None:
+                raise RuntimeError("Rebuildable Nanogrid face topology cannot be refreshed during CUDA graph capture")
+            self._topology_capture_locked = True
+
         self._cell_grid.get_voxels(out=self._cell_ijk)
 
         _fill_rebuildable_node_candidates(

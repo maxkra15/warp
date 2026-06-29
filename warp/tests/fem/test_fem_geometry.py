@@ -569,6 +569,64 @@ def test_nanogrid_rebuild_capture(test, device):
     np.testing.assert_array_equal(voxels_np, np.array([[0, 0, 0], [1, 0, 0], [3, 0, 0]], dtype=np.int32))
 
 
+def test_nanogrid_rebuild_capture_topology_lock(test, device):
+    points = wp.array([[0, 0, 0]], dtype=wp.int32, device=device)
+
+    volume = wp.Volume.allocate_by_voxels(
+        points,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=1,
+        max_leaf_nodes=1,
+        max_lower_nodes=1,
+        max_upper_nodes=1,
+    )
+    geo = fem.Nanogrid(volume, rebuildable=True)
+
+    wp.load_module(device=device)
+    with wp.ScopedCapture(device=device, force_module_load=False):
+        geo.rebuild(points)
+
+    with test.assertRaisesRegex(RuntimeError, "before CUDA graph capture"):
+        fem.make_polynomial_space(geo, degree=2, element_basis=fem.ElementBasis.SERENDIPITY)
+
+    volume_with_faces = wp.Volume.allocate_by_voxels(
+        points,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=1,
+        max_leaf_nodes=1,
+        max_lower_nodes=1,
+        max_upper_nodes=1,
+    )
+    geo_with_faces = fem.Nanogrid(volume_with_faces, rebuildable=True)
+    geo_with_faces.side_count()
+
+    with test.assertRaisesRegex(RuntimeError, "face topology"):
+        with wp.ScopedCapture(device=device, force_module_load=False):
+            geo_with_faces.rebuild(points)
+
+
+def test_nanogrid_rebuild_face_topology(test, device):
+    points = wp.array([[0, 0, 0]], dtype=wp.int32, device=device)
+    volume = wp.Volume.allocate_by_voxels(
+        points,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=1,
+        max_leaf_nodes=1,
+        max_lower_nodes=1,
+        max_upper_nodes=1,
+    )
+    geo = fem.Nanogrid(volume, rebuildable=True)
+
+    with test.assertRaisesRegex(NotImplementedError, "Face-noded spaces"):
+        fem.make_polynomial_space(geo, degree=2)
+
+
 def test_nanogrid_guess_lookup_radius(test, device):
     with wp.ScopedDevice(device):
         voxel = wp.array([[0, 0, 0]], dtype=int, device=device)
@@ -879,6 +937,15 @@ add_function_test(
     TestFemGeometry, "test_nanogrid_rebuild_edge_capacity", test_nanogrid_rebuild_edge_capacity, devices=cuda_devices
 )
 add_function_test(TestFemGeometry, "test_nanogrid_rebuild_capture", test_nanogrid_rebuild_capture, devices=cuda_devices)
+add_function_test(
+    TestFemGeometry,
+    "test_nanogrid_rebuild_capture_topology_lock",
+    test_nanogrid_rebuild_capture_topology_lock,
+    devices=cuda_devices,
+)
+add_function_test(
+    TestFemGeometry, "test_nanogrid_rebuild_face_topology", test_nanogrid_rebuild_face_topology, devices=devices
+)
 add_function_test(
     TestFemGeometry, "test_nanogrid_guess_lookup_radius", test_nanogrid_guess_lookup_radius, devices=cuda_devices
 )

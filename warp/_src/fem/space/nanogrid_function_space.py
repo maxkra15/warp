@@ -34,13 +34,16 @@ class NanogridSpaceTopology(SpaceTopology):
         shape: CubeShapeFunction,
     ):
         self._shape = shape
+        need_edge_indices = shape.EDGE_NODE_COUNT > 0
+        need_face_indices = shape.FACE_NODE_COUNT > 0
+
+        if isinstance(grid, Nanogrid) and grid._rebuildable and need_face_indices:
+            raise NotImplementedError("Face-noded spaces are not supported for rebuildable Nanogrids")
+
         super().__init__(grid, shape.NODES_PER_ELEMENT)
         self._grid = grid
 
         self._vertex_grid = grid.vertex_grid.id
-
-        need_edge_indices = shape.EDGE_NODE_COUNT > 0
-        need_face_indices = shape.FACE_NODE_COUNT > 0
 
         if isinstance(grid, Nanogrid):
             self._edge_grid = grid.edge_grid.id if need_edge_indices else -1
