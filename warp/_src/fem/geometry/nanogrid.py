@@ -606,7 +606,8 @@ class Nanogrid(NanogridBase):
             temporary_store: Shared pool from which to allocate temporary arrays.
             scalar_type: Scalar type for grid coordinates (``wp.float32`` or ``wp.float64``).
             device: CUDA device on which to build the packed volume.
-            rebuildable: Whether to allocate persistent capacity for rebuilds.
+            rebuildable: Whether to allocate persistent capacity for in-place topology refreshes. Auxiliary edge
+                topology required by a FEM space is allocated lazily when the space is constructed.
             max_active_voxels: Maximum number of active voxels for rebuilds. Defaults to the packed cell count.
             max_leaf_nodes: Maximum number of NanoVDB leaf nodes for rebuilds. Defaults to ``max_active_voxels``.
             max_lower_nodes: Maximum number of lower internal nodes for rebuilds. Defaults to ``max_leaf_nodes``.
@@ -673,7 +674,8 @@ class Nanogrid(NanogridBase):
             temporary_store: shared pool from which to allocate temporary arrays
             scalar_type: Scalar type for grid coordinates (``wp.float32`` or ``wp.float64``)
             rebuildable: Whether to retain capacity-sized topology buffers that can be refreshed with
-                :meth:`rebuild_topology_from_cells`.
+                :meth:`rebuild_topology_from_cells`. Auxiliary edge topology required by a FEM space is allocated
+                lazily when the space is constructed, then refreshed in place by later rebuilds.
         """
 
         self._cell_grid = grid

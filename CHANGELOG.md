@@ -38,7 +38,8 @@
   accumulation patterns; consumed-return counter atomics require explicit replay functions and are rejected in generated
   backward replay to avoid incorrect gradients ([GH-1443](https://github.com/NVIDIA/warp/issues/1443)).
 - Add rebuildable NanoVDB volumes with capacity/status controls, point masks, CPU parity, CUDA graph-capturable
-  rebuilds, `warp.fem.Nanogrid` topology refresh support for rebuildable volumes, and an
+  rebuilds, `warp.fem.Nanogrid` topology refresh support for vertex- and edge-noded spaces over rebuildable volumes,
+  and an
   `example_apic_fluid` path that exercises captured grid rebuilds.
 - Add row-capacity support to `warp.sparse` BSR matrices, including padded topology policies for topology-changing
   sparse operations, `bsr_zeros(row_capacity=...)` for reserving row capacity, `bsr_compress()` for inplace compaction of sparse matrices, and sparse status constants for overflow checks ([GH-1537](https://github.com/NVIDIA/warp/issues/1537)).
