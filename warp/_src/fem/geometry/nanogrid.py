@@ -716,6 +716,8 @@ class Nanogrid(NanogridBase):
 
         self._edge_count = 0
         self._edge_grid = None
+        self._edge_candidates = None
+        self._edge_candidate_mask = None
 
         # Dynamic Arg structs
         self.CellArg = _make_nanogrid_cell_arg(scalar_type)
@@ -1046,8 +1048,14 @@ class Nanogrid(NanogridBase):
         self._boundary_face_indices = boundary_face_indices.detach()
 
     def _build_edge_grid(self, temporary_store: cache.TemporaryStore | None = None):
-        self._edge_grid = _build_edge_grid(self._cell_ijk, self._cell_grid, temporary_store)
-        self._edge_count = self._edge_grid.get_voxel_count()
+        if self._rebuildable:
+            self._edge_grid, self._edge_candidates, self._edge_candidate_mask = _build_rebuildable_edge_grid(
+                self._cell_ijk, self._cell_grid
+            )
+            self._edge_count = self._edge_grid.get_rebuild_info().max_voxel_count
+        else:
+            self._edge_grid = _build_edge_grid(self._cell_ijk, self._cell_grid, temporary_store)
+            self._edge_count = self._edge_grid.get_voxel_count()
 
     def _ensure_edge_grid(self):
         if self._edge_grid is None:
@@ -1067,8 +1075,14 @@ class Nanogrid(NanogridBase):
         self._face_env = None
         self._face_flags = None
         self._boundary_face_indices = None
-        self._edge_grid = None
-        self._edge_count = 0
+        if self._edge_candidates is None:
+            self._edge_grid = None
+            self._edge_count = 0
+        else:
+            _fill_rebuildable_edge_candidates(
+                self._cell_grid, self._cell_ijk, self._edge_candidates, self._edge_candidate_mask
+            )
+            self._edge_grid.rebuild(self._edge_candidates.flatten(), point_mask=self._edge_candidate_mask)
 
         self.cell_arg_value.invalidate(self)
         self.side_arg_value.invalidate(self)
@@ -1631,6 +1645,33 @@ def _cell_edge_indices(cell_ijk: wp.array(dtype=wp.vec3i), edge_ijk: wp.array2d(
     edge_ijk[cell, 11] = NanogridBase._add_axis_flag(ijk + wp.vec3i(0, 1, 0), 2)
 
 
+@wp.kernel
+def _rebuildable_cell_edge_indices(
+    cell_grid: wp.uint64,
+    cell_ijk: wp.array(dtype=wp.vec3i),
+    edge_ijk: wp.array2d(dtype=wp.vec3i),
+    edge_mask: wp.array(dtype=wp.int32),
+):
+    cell = wp.tid()
+    ijk = cell_ijk[cell]
+    edge_ijk[cell, 0] = NanogridBase._add_axis_flag(ijk, 0)
+    edge_ijk[cell, 1] = NanogridBase._add_axis_flag(ijk, 1)
+    edge_ijk[cell, 2] = NanogridBase._add_axis_flag(ijk, 2)
+    edge_ijk[cell, 3] = NanogridBase._add_axis_flag(ijk + wp.vec3i(0, 1, 0), 0)
+    edge_ijk[cell, 4] = NanogridBase._add_axis_flag(ijk + wp.vec3i(0, 0, 1), 1)
+    edge_ijk[cell, 5] = NanogridBase._add_axis_flag(ijk + wp.vec3i(1, 0, 0), 2)
+    edge_ijk[cell, 6] = NanogridBase._add_axis_flag(ijk + wp.vec3i(0, 1, 1), 0)
+    edge_ijk[cell, 7] = NanogridBase._add_axis_flag(ijk + wp.vec3i(1, 0, 1), 1)
+    edge_ijk[cell, 8] = NanogridBase._add_axis_flag(ijk + wp.vec3i(1, 1, 0), 2)
+    edge_ijk[cell, 9] = NanogridBase._add_axis_flag(ijk + wp.vec3i(0, 0, 1), 0)
+    edge_ijk[cell, 10] = NanogridBase._add_axis_flag(ijk + wp.vec3i(1, 0, 0), 1)
+    edge_ijk[cell, 11] = NanogridBase._add_axis_flag(ijk + wp.vec3i(0, 1, 0), 2)
+
+    active = wp.where(cell < wp.volume_voxel_count(cell_grid), wp.int32(1), wp.int32(0))
+    for edge in range(12):
+        edge_mask[cell * 12 + edge] = active
+
+
 def _build_node_grid(cell_ijk, grid: wp.Volume, temporary_store: cache.TemporaryStore):
     cell_count = cell_ijk.shape[0]
     cell_nodes = cache.borrow_temporary(temporary_store, shape=(cell_count, 8), dtype=wp.vec3i, device=cell_ijk.device)
@@ -1656,28 +1697,33 @@ def _fill_rebuildable_node_candidates(
     )
 
 
+def _build_rebuildable_entity_grid(candidates, candidate_mask, grid: wp.Volume, hierarchy_expansion: int):
+    entity_capacity = candidates.size
+    rebuild_info = grid.get_rebuild_info()
+    max_leaf_nodes = min(entity_capacity, rebuild_info.max_leaf_node_count * hierarchy_expansion)
+    max_lower_nodes = min(max_leaf_nodes, rebuild_info.max_lower_node_count * hierarchy_expansion)
+    max_upper_nodes = min(max_lower_nodes, rebuild_info.max_upper_node_count * hierarchy_expansion)
+
+    return wp.Volume.allocate_by_voxels(
+        candidates.flatten(),
+        voxel_size=grid.get_voxel_size(),
+        device=candidates.device,
+        rebuildable=True,
+        max_active_voxels=entity_capacity,
+        max_leaf_nodes=max_leaf_nodes,
+        max_lower_nodes=max_lower_nodes,
+        max_upper_nodes=max_upper_nodes,
+        point_mask=candidate_mask,
+    )
+
+
 def _build_rebuildable_node_grid(cell_ijk, grid: wp.Volume):
     node_capacity = cell_ijk.shape[0] * 8
     node_candidates = wp.empty(shape=(cell_ijk.shape[0], 8), dtype=wp.vec3i, device=cell_ijk.device)
     node_candidate_mask = wp.empty(shape=(node_capacity,), dtype=wp.int32, device=cell_ijk.device)
     _fill_rebuildable_node_candidates(grid, cell_ijk, node_candidates, node_candidate_mask)
 
-    rebuild_info = grid.get_rebuild_info()
-    max_leaf_nodes = min(node_capacity, rebuild_info.max_leaf_node_count * 8)
-    max_lower_nodes = min(max_leaf_nodes, rebuild_info.max_lower_node_count * 8)
-    max_upper_nodes = min(max_lower_nodes, rebuild_info.max_upper_node_count * 8)
-
-    node_grid = wp.Volume.allocate_by_voxels(
-        node_candidates.flatten(),
-        voxel_size=grid.get_voxel_size(),
-        device=cell_ijk.device,
-        rebuildable=True,
-        max_active_voxels=node_capacity,
-        max_leaf_nodes=max_leaf_nodes,
-        max_lower_nodes=max_lower_nodes,
-        max_upper_nodes=max_upper_nodes,
-        point_mask=node_candidate_mask,
-    )
+    node_grid = _build_rebuildable_entity_grid(node_candidates, node_candidate_mask, grid, hierarchy_expansion=8)
 
     return node_grid, node_candidates, node_candidate_mask
 
@@ -1702,6 +1748,31 @@ def _build_edge_grid(cell_ijk, grid: wp.Volume, temporary_store: cache.Temporary
     )
     cell_edges.release()
     return edge_grid
+
+
+def _fill_rebuildable_edge_candidates(
+    cell_grid: wp.Volume,
+    cell_ijk: wp.array,
+    edge_candidates: wp.array2d,
+    edge_candidate_mask: wp.array,
+):
+    wp.launch(
+        _rebuildable_cell_edge_indices,
+        dim=cell_ijk.shape[0],
+        inputs=[cell_grid.id, cell_ijk, edge_candidates, edge_candidate_mask],
+        device=cell_ijk.device,
+    )
+
+
+def _build_rebuildable_edge_grid(cell_ijk, grid: wp.Volume):
+    edge_capacity = cell_ijk.shape[0] * 12
+    edge_candidates = wp.empty(shape=(cell_ijk.shape[0], 12), dtype=wp.vec3i, device=cell_ijk.device)
+    edge_candidate_mask = wp.empty(shape=(edge_capacity,), dtype=wp.int32, device=cell_ijk.device)
+    _fill_rebuildable_edge_candidates(grid, cell_ijk, edge_candidates, edge_candidate_mask)
+
+    edge_grid = _build_rebuildable_entity_grid(edge_candidates, edge_candidate_mask, grid, hierarchy_expansion=12)
+
+    return edge_grid, edge_candidates, edge_candidate_mask
 
 
 @wp.kernel
