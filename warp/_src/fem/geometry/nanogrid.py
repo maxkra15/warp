@@ -12,6 +12,7 @@ from warp._src.fem import cache, utils
 from warp._src.fem.cache import cached_vec_type
 from warp._src.fem.types import NULL_ELEMENT_INDEX, OUTSIDE, ElementIndex, Sample, make_coords, make_free_sample
 from warp._src.logger import log_warning
+from warp._src.types import _volume_rebuild_status_array
 
 from .element import Element
 from .geometry import Geometry, _array_load
@@ -815,6 +816,10 @@ class Nanogrid(NanogridBase):
 
         if not self._rebuildable:
             raise RuntimeError("Nanogrid was not constructed in rebuildable mode")
+
+        self._check_rebuildable_topology_capture()
+        if status is not None:
+            status = _volume_rebuild_status_array(status, self._cell_grid.device)
 
         self._refresh_rebuildable_topology(status=status, preserve_status=False)
 

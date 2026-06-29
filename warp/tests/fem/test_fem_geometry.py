@@ -783,6 +783,33 @@ def test_nanogrid_rebuild_capture_topology_lock(test, device):
         test.fail(f"Validation-only capture failure locked unprepared topology: {exc}")
     test.assertEqual(unprepared_space.topology._edge_grid, unprepared_geo.edge_grid.id)
 
+    invalid_status_volume = wp.Volume.allocate_by_voxels(
+        points,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=1,
+        max_leaf_nodes=1,
+        max_lower_nodes=1,
+        max_upper_nodes=1,
+    )
+    unprepared_status_geo = fem.Nanogrid(invalid_status_volume, rebuildable=True)
+    invalid_status = wp.zeros(1, dtype=wp.int32, device=device)
+
+    with wp.ScopedCapture(device=device, force_module_load=False):
+        with test.assertRaisesRegex(
+            RuntimeError, "^status must be a Warp array with dtype uint32 and at least one element$"
+        ):
+            unprepared_status_geo.rebuild_topology_from_cells(status=invalid_status)
+
+    try:
+        unprepared_status_space = fem.make_polynomial_space(
+            unprepared_status_geo, degree=2, element_basis=fem.ElementBasis.SERENDIPITY
+        )
+    except RuntimeError as exc:
+        test.fail(f"Invalid topology status locked unprepared topology: {exc}")
+    test.assertEqual(unprepared_status_space.topology._edge_grid, unprepared_status_geo.edge_grid.id)
+
     with wp.ScopedCapture(device=device, force_module_load=False):
         with test.assertRaisesRegex(RuntimeError, "face topology"):
             geo.side_count()
