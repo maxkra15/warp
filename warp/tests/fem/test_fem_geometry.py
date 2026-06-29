@@ -602,7 +602,16 @@ def test_nanogrid_rebuild_capture_topology_lock(test, device):
         max_upper_nodes=1,
     )
     geo_with_faces = fem.Nanogrid(volume_with_faces, rebuildable=True)
-    geo_with_faces.side_count()
+    face_count = geo_with_faces.side_count()
+    capture_buffer = wp.zeros(1, dtype=wp.int32, device=device)
+
+    with wp.ScopedCapture(device=device, force_module_load=False):
+        try:
+            captured_face_count = geo_with_faces.side_count()
+        except RuntimeError as exc:
+            test.fail(f"Materialized face topology access failed during CUDA graph capture: {exc}")
+        test.assertEqual(captured_face_count, face_count)
+        capture_buffer.fill_(1)
 
     with test.assertRaisesRegex(RuntimeError, "face topology"):
         with wp.ScopedCapture(device=device, force_module_load=False):

@@ -1057,7 +1057,11 @@ class Nanogrid(NanogridBase):
         self._boundary_face_indices = boundary_face_indices.detach()
 
     def _ensure_face_grid(self):
-        if self._rebuildable and (self._cell_grid.device.is_capturing or self._topology_capture_locked):
+        if (
+            self._face_ijk is None
+            and self._rebuildable
+            and (self._cell_grid.device.is_capturing or self._topology_capture_locked)
+        ):
             raise RuntimeError("Rebuildable Nanogrid face topology is not supported during or after CUDA graph capture")
         super()._ensure_face_grid()
 
