@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import platform
+import tempfile
 import unittest
 
 import numpy as np
@@ -166,6 +167,19 @@ def _assert_multi_env_node_isolation(test, geo: fem.Geometry, space: fem.Functio
         nodes = nodes[nodes != fem.NULL_NODE_INDEX]
         test.assertTrue(np.all(nodes >= env_index * base_node_count))
         test.assertTrue(np.all(nodes < (env_index + 1) * base_node_count))
+
+
+def _assert_graph_allocations_balanced(test, graph):
+    with tempfile.TemporaryDirectory() as temp_dir:
+        dot_path = f"{temp_dir}/graph.dot"
+        wp.capture_debug_dot_print(graph, dot_path, verbose=True)
+        with open(dot_path, encoding="utf-8") as dot_file:
+            dot = dot_file.read().lower()
+    test.assertEqual(
+        dot.count("mem_alloc"),
+        dot.count("mem_free"),
+        "captured graph contains persistent allocations without matching frees",
+    )
 
 
 def _assert_sparse_multi_env_node_isolation(test, geo: fem.Geometry, space: fem.FunctionSpace, cell_env, device):
@@ -1051,6 +1065,130 @@ def test_nanogrid_multi_env_rebuild_capture_updates_automatic_offsets(test, devi
         fem.interpolate(_test_empty_environment_lookup, at=quadrature, values={"empty_env": 2})
 
 
+def test_nanogrid_multi_env_rebuild_partition_capture(test, device):
+    with wp.ScopedDevice(device):
+        temporary_store = fem.TemporaryStore()
+        points = wp.array(
+            [[0.0, 0.0, 0.0], [0.0, 0.0, 0.0], [4.0, 0.0, 0.0], [4.0, 0.0, 0.0]],
+            dtype=wp.vec3f,
+            device=device,
+        )
+        point_envs = wp.array([0, 1, 0, 1], dtype=wp.int32, device=device)
+        point_mask = wp.array([1, 1, 0, 0], dtype=wp.int32, device=device)
+        status = wp.zeros(1, dtype=wp.uint32, device=device)
+        geo = fem.Nanogrid.from_environment_voxels(
+            points,
+            point_envs,
+            2,
+            point_mask=point_mask,
+            voxel_size=1.0,
+            temporary_store=temporary_store,
+            device=device,
+            rebuildable=True,
+            max_active_voxels=4,
+            max_leaf_nodes=4,
+            max_lower_nodes=4,
+            max_upper_nodes=4,
+            status=status,
+        )
+
+        space = fem.make_polynomial_space(geo, degree=2, element_basis=fem.ElementBasis.SERENDIPITY)
+        cell_grid_id = geo.cell_grid.id
+        vertex_grid_id = geo.vertex_grid.id
+        edge_grid = geo.edge_grid
+        edge_grid_id = edge_grid.id
+        env_offsets = geo.env_offsets
+        env_offsets_ptr = env_offsets.ptr
+
+        cell_mask = wp.array([1, 1, 0, 0], dtype=int, device=device)
+        geo_partition = fem.ExplicitGeometryPartition(
+            geo,
+            cell_mask,
+            max_cell_count=4,
+            max_side_count=0,
+            temporary_store=temporary_store,
+        )
+        space_partition = fem.make_space_partition(
+            space_topology=space.topology,
+            geometry_partition=geo_partition,
+            environment_first=True,
+            with_halo=False,
+            max_node_count=space.node_count(),
+            device=device,
+            temporary_store=temporary_store,
+        )
+
+        test.assertEqual(space.node_count(), 80)
+        test.assertEqual(space.topology._vertex_grid, vertex_grid_id)
+        test.assertEqual(space.topology._edge_grid, edge_grid_id)
+
+        # Warm every rebuild and cached argument used by the captured chain.
+        geo.rebuild(points, point_envs, status=status, point_mask=point_mask)
+        geo_partition.rebuild(cell_mask, temporary_store=temporary_store)
+        space_partition.rebuild(device=device, temporary_store=temporary_store)
+        geo.cell_arg_value(device)
+        geo_partition.cell_arg_value(device)
+        space.topology.topo_arg_value(device)
+        space.basis.basis_arg_value(device)
+        space_partition.partition_arg_value(device)
+        wp.load_module(device=device)
+        wp.synchronize_device(device)
+
+        initial_env_offsets = env_offsets.numpy().copy()
+        geo_partition_arrays = (geo_partition._cells, geo_partition._partition_cells)
+        space_partition_arrays = (
+            space_partition.space_node_indices(),
+            space_partition._space_to_partition,
+            space_partition.env_offsets,
+        )
+        partition_ptrs = tuple(array.ptr for array in (*geo_partition_arrays, *space_partition_arrays))
+
+        with wp.ScopedCapture(device=device, force_module_load=False) as capture:
+            geo.rebuild(points, point_envs, status=status, point_mask=point_mask)
+            geo_partition.rebuild(cell_mask, temporary_store=temporary_store)
+            space_partition.rebuild(device=device, temporary_store=temporary_store)
+
+        _assert_graph_allocations_balanced(test, capture.graph)
+        np.testing.assert_array_equal(initial_env_offsets, np.array([[0, 0, 0], [4, 0, 0]], dtype=np.int32))
+        np.testing.assert_array_equal(space_partition.env_offsets.numpy(), np.array([0, 20, 80], dtype=np.int32))
+
+        point_mask.fill_(1)
+        cell_mask.fill_(1)
+        wp.capture_launch(capture.graph)
+        wp.synchronize_device(device)
+
+        test.assertEqual(int(status.numpy()[0]), wp.Volume.REBUILD_SUCCESS)
+        test.assertIs(geo.env_offsets, env_offsets)
+        test.assertEqual(geo.env_offsets.ptr, env_offsets_ptr)
+        rebuilt_env_offsets = geo.env_offsets.numpy()
+        np.testing.assert_array_equal(rebuilt_env_offsets, np.array([[0, 0, 0], [8, 0, 0]], dtype=np.int32))
+        test.assertFalse(np.array_equal(rebuilt_env_offsets, initial_env_offsets))
+        test.assertGreaterEqual(rebuilt_env_offsets[1, 0] - (4 + rebuilt_env_offsets[0, 0]) - 1, 3)
+
+        test.assertEqual(geo.cell_grid.get_active_stats().voxel_count, 4)
+        test.assertEqual(geo.vertex_grid.get_active_stats().voxel_count, 32)
+        test.assertEqual(geo.edge_grid.get_active_stats().voxel_count, 48)
+        test.assertEqual(sorted(geo.cell_env.numpy()[:4].tolist()), [0, 0, 1, 1])
+
+        test.assertEqual(geo.cell_grid.id, cell_grid_id)
+        test.assertEqual(geo.vertex_grid.id, vertex_grid_id)
+        test.assertIs(geo.edge_grid, edge_grid)
+        test.assertEqual(geo.edge_grid.id, edge_grid_id)
+        test.assertEqual(space.topology._vertex_grid, vertex_grid_id)
+        test.assertEqual(space.topology._edge_grid, edge_grid_id)
+
+        test.assertIs(geo_partition._cells, geo_partition_arrays[0])
+        test.assertIs(geo_partition._partition_cells, geo_partition_arrays[1])
+        test.assertIs(space_partition.space_node_indices(), space_partition_arrays[0])
+        test.assertIs(space_partition._space_to_partition, space_partition_arrays[1])
+        test.assertIs(space_partition.env_offsets, space_partition_arrays[2])
+        test.assertEqual(
+            tuple(array.ptr for array in (*geo_partition_arrays, *space_partition_arrays)),
+            partition_ptrs,
+        )
+        np.testing.assert_array_equal(space_partition.env_offsets.numpy(), np.array([0, 40, 80], dtype=np.int32))
+
+
 def test_nanogrid_multi_env_rebuild_preserves_explicit_offsets(test, device):
     points = wp.array([[0, 0, 0], [0, 0, 0]], dtype=wp.vec3i, device=device)
     point_envs = wp.array([0, 1], dtype=wp.int32, device=device)
@@ -1183,6 +1321,9 @@ def test_adaptive_nanogrid_multi_env(test, device):
 devices = get_test_devices()
 cuda_devices = get_selected_cuda_test_devices()
 capture_cuda_devices = get_selected_cuda_test_devices_with_mempool()
+capture_devices = [
+    device for device in get_test_devices_with_graph_capture_allocation_and_cuda_graph_module_load() if device.is_cuda
+]
 
 
 class TestFemMultiEnv(unittest.TestCase):
@@ -1208,6 +1349,12 @@ add_function_test(
     "test_nanogrid_multi_env_rebuild_capture_updates_automatic_offsets",
     test_nanogrid_multi_env_rebuild_capture_updates_automatic_offsets,
     devices=capture_cuda_devices,
+)
+add_function_test(
+    TestFemMultiEnv,
+    "test_nanogrid_multi_env_rebuild_partition_capture",
+    test_nanogrid_multi_env_rebuild_partition_capture,
+    devices=capture_devices,
 )
 add_function_test(
     TestFemMultiEnv,
