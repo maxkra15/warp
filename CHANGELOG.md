@@ -64,6 +64,14 @@
   `wp.sparse.bsr_set_from_triplets()`, `wp.sparse.bsr_set_transpose()`, and reusable launches created with
   `wp.launch(..., record_cmd=True)`, so saved CPU graphs replay them from current inputs
   ([GH-1431](https://github.com/NVIDIA/warp/issues/1431)).
+- Add CUDA APIC capture support for `wp.utils.array_scan()`, `wp.utils.radix_sort_pairs()`,
+  `wp.utils.segmented_sort_pairs()`, `wp.utils.runlength_encode()` (with an explicit `run_count`), contiguous
+  `wp.array.fill_()`, `wp.sparse.bsr_set_transpose()`, `wp.capture_if()` / `wp.capture_while()`, and adjoint and
+  reusable (`wp.launch(..., record_cmd=True)`) launches, so saved CUDA graphs replay them from current inputs.
+  `wp.sparse.bsr_set_from_triplets()`, unsupported `wp.array.fill_()` variants, the
+  host-return form of `wp.utils.runlength_encode()`, and `wp.copy()` other than a contiguous same-device copy
+  (cross-device or non-contiguous copies) cannot be captured on CUDA and raise during APIC capture
+  ([GH-1431](https://github.com/NVIDIA/warp/issues/1431)).
 
 ### Removed
 
@@ -120,6 +128,11 @@
 - Fix capped environment-first `warp.fem` space partitions to rebuild without host synchronization during CUDA graph
   capture, preserve fixed-capacity environment batches, and prevent graph-captured FEM temporaries from being recycled
   while their pointers are still retained ([GH-1407](https://github.com/NVIDIA/warp/issues/1407)).
+- Fix eager Python calls to generic `@wp.func` functions to resolve a matching generic template after other concrete
+  overloads have already been instantiated ([GH-1603](https://github.com/NVIDIA/warp/issues/1603)).
+- Fix `wp.tile_dot()` compilation failure for scalar `wp.float64` and `wp.float16` tiles, which previously narrowed
+  the result to `float` and mismatched the inferred result type
+  ([GH-1563](https://github.com/NVIDIA/warp/issues/1563)).
 - Fix `wp.load_module()` and `wp.ScopedCapture(force_module_load=True)` after CPU launches so CUDA graph capture
   precompiles the correct CUDA kernel variant. On CUDA drivers older than 12.3 this previously raised
   `CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED`; on newer drivers it silently recompiled inside the capture window
@@ -185,6 +198,16 @@
 - Fix CPU APIC graph capture of untracked or native-only host buffers used by memory operations, so saved graphs no
   longer drop captured copies and fills or depend on capture-time pointers
   ([GH-1431](https://github.com/NVIDIA/warp/issues/1431)).
+- Fix CUDA graph capture of padded `wp.sparse.bsr_set_transpose()` and `wp.sparse.bsr_set_from_triplets()`: the
+  row-capacity status buffer is now allocated when the matrix is created rather than during capture, so capturing
+  these operations no longer leaves an invalid capture-scoped buffer that fails on later host access and disrupts
+  subsequent CUDA operations ([GH-1431](https://github.com/NVIDIA/warp/issues/1431)).
+- Fix CUDA graph capture that begins as the first operation on a context: the one-time memory-pool warm-up now runs
+  before capture starts instead of on the legacy stream mid-capture, which previously invalidated the capture and
+  left the graph unbuildable ([GH-1431](https://github.com/NVIDIA/warp/issues/1431)).
+- Fix APIC replay of padded `wp.sparse.bsr_set_transpose()` so the destination row-capacity offsets are reconstructed
+  on replay, allowing the captured graph to rebuild the destination even when its offsets were reset
+  before `wp.capture_launch()` ([GH-1587](https://github.com/NVIDIA/warp/issues/1587)).
 - Harden CPU APIC graph capture for loaded `.wrp` graphs and coexistence with CUDA captures: distinct unique-module
   kernels now replay correctly after save/load, stale `BsrMatrix.nnz_sync()` readbacks of a topology recorded earlier
   in the same capture are rejected, recording hooks are scoped to the capture's target device, and capture
