@@ -12,6 +12,7 @@ from warp._src.fem import cache, utils
 from warp._src.fem.cache import cached_vec_type
 from warp._src.fem.types import NULL_ELEMENT_INDEX, OUTSIDE, ElementIndex, Sample, make_coords, make_free_sample
 from warp._src.logger import log_warning
+from warp._src.types import _volume_rebuild_status_array
 
 from .element import Element
 from .geometry import Geometry, _array_load
@@ -610,9 +611,10 @@ class Nanogrid(NanogridBase):
             scalar_type: Scalar type for grid coordinates (``wp.float32`` or ``wp.float64``).
             device: CUDA device on which to build the packed volume.
             rebuildable: Whether to allocate a cell grid with persistent rebuild capacity and retain capacity-sized
-                topology buffers for in-place refreshes. Auxiliary edge topology is allocated lazily by FEM space
-                construction. FEM spaces and their required topology must be materialized before CUDA graph capture;
-                only subsequent in-place topology refreshes are capture-safe.
+                topology buffers for in-place refreshes. Edge-noded FEM spaces used by captured rebuilds must be
+                constructed before capture because the first captured topology refresh locks the prepared topology
+                set, after which lazy topology materialization raises an error; face-noded FEM spaces remain
+                unsupported for rebuildable Nanogrids.
             max_active_voxels: Maximum number of active voxels for rebuilds. Defaults to the packed cell count.
             max_leaf_nodes: Maximum number of NanoVDB leaf nodes for rebuilds. Defaults to ``max_active_voxels``.
             max_lower_nodes: Maximum number of lower internal nodes for rebuilds. Defaults to ``max_leaf_nodes``.
@@ -685,9 +687,10 @@ class Nanogrid(NanogridBase):
             temporary_store: shared pool from which to allocate temporary arrays
             scalar_type: Scalar type for grid coordinates (``wp.float32`` or ``wp.float64``)
             rebuildable: Whether to retain capacity-sized topology buffers that can be refreshed with
-                :meth:`rebuild_topology_from_cells`. Auxiliary edge topology required by a FEM space is allocated
-                lazily when the space is constructed. FEM spaces and their required topology must be materialized before
-                CUDA graph capture; only subsequent in-place topology refreshes are capture-safe.
+                :meth:`rebuild_topology_from_cells`. Edge-noded FEM spaces allocate their auxiliary topology lazily and
+                must be constructed before capture because the first captured topology refresh locks the prepared
+                topology set, after which lazy topology materialization raises an error; face-noded FEM spaces remain
+                unsupported for rebuildable Nanogrids.
             automatic_env_offsets: Whether ``env_offsets`` were generated automatically and should be refreshed before
                 packing multi-environment rebuild points.
             guard_cells: Number of empty packed cells to preserve between automatically packed environments.
@@ -728,8 +731,11 @@ class Nanogrid(NanogridBase):
         )
 
         self._rebuildable = rebuildable
+        self._topology_capture_locked = False
         self._node_candidates = node_candidates
         self._node_candidate_mask = node_candidate_mask
+        self._node_rebuild_status = wp.empty(1, dtype=wp.uint32, device=device) if rebuildable else None
+        self._edge_rebuild_status = wp.empty(1, dtype=wp.uint32, device=device) if rebuildable else None
 
         self._automatic_env_offsets = automatic_env_offsets and self.environment_count() > 1
         self._env_offset_guard_cells = guard_cells
@@ -773,7 +779,8 @@ class Nanogrid(NanogridBase):
             point_envs: Optional ``int32`` array with one environment index per point. Required for
                 multi-environment Nanogrids. Entries for unmasked points must satisfy
                 ``0 <= env < environment_count``.
-            status: Optional one-element ``uint32`` array receiving rebuild status flags.
+            status: Optional one-element ``uint32`` array receiving the union of raw cell-grid and prepared auxiliary
+                topology ``Volume.REBUILD_*`` flags.
             point_mask: Optional ``int32`` array with one entry per point. Points with a zero mask value are ignored.
 
         Returns:
@@ -782,6 +789,8 @@ class Nanogrid(NanogridBase):
 
         if not self._rebuildable:
             raise RuntimeError("Nanogrid was not constructed in rebuildable mode")
+
+        self._check_rebuildable_topology_capture()
 
         points = _nanogrid_rebuild_points_array(points, self._cell_grid.device)
         point_count = points.shape[0]
@@ -818,7 +827,7 @@ class Nanogrid(NanogridBase):
         if packed_points is not None:
             packed_points.release()
 
-        self.rebuild_topology_from_cells()
+        self._refresh_rebuildable_topology(status=status, preserve_status=True)
         return status
 
     def _refresh_automatic_environment_offsets(
@@ -898,13 +907,25 @@ class Nanogrid(NanogridBase):
             device=device,
         )
 
-    def rebuild_topology_from_cells(self):
-        """Refresh Nanogrid topology buffers from the current cell grid."""
+    def rebuild_topology_from_cells(self, status: wp.array | None = None):
+        """Refresh Nanogrid topology buffers from the current cell grid.
+
+        During CUDA graph capture, use :meth:`rebuild` if dynamic geometry face topology may already have been
+        materialized, because it preflights topology before work on the underlying :class:`warp.Volume` is recorded.
+
+        Args:
+            status: Optional one-element ``uint32`` array receiving the union of vertex and prepared edge topology
+                ``Volume.REBUILD_*`` flags.
+        """
 
         if not self._rebuildable:
             raise RuntimeError("Nanogrid was not constructed in rebuildable mode")
 
-        self._refresh_rebuildable_topology()
+        self._check_rebuildable_topology_capture()
+        if status is not None:
+            status = _volume_rebuild_status_array(status, self._cell_grid.device)
+
+        self._refresh_rebuildable_topology(status=status, preserve_status=False)
 
     @property
     def edge_grid(self) -> wp.Volume:
@@ -1159,6 +1180,15 @@ class Nanogrid(NanogridBase):
         boundary_face_mask.release()
         self._boundary_face_indices = boundary_face_indices.detach()
 
+    def _ensure_face_grid(self):
+        if (
+            self._face_ijk is None
+            and self._rebuildable
+            and (self._cell_grid.device.is_capturing or self._topology_capture_locked)
+        ):
+            raise RuntimeError("Rebuildable Nanogrid face topology is not supported during or after CUDA graph capture")
+        super()._ensure_face_grid()
+
     def _build_edge_grid(self, temporary_store: cache.TemporaryStore | None = None):
         if self._rebuildable:
             self._edge_grid, self._edge_candidates, self._edge_candidate_mask = _build_rebuildable_edge_grid(
@@ -1171,15 +1201,28 @@ class Nanogrid(NanogridBase):
 
     def _ensure_edge_grid(self):
         if self._edge_grid is None:
+            if self._rebuildable and (self._cell_grid.device.is_capturing or self._topology_capture_locked):
+                raise RuntimeError("Rebuildable Nanogrid edge topology must be materialized before CUDA graph capture")
             self._build_edge_grid()
 
-    def _refresh_rebuildable_topology(self):
+    def _check_rebuildable_topology_capture(self):
+        if self._cell_grid.device.is_capturing and self._face_grid is not None:
+            raise RuntimeError("Rebuildable Nanogrid face topology cannot be refreshed during CUDA graph capture")
+
+    def _refresh_rebuildable_topology(self, status: wp.array | None = None, preserve_status: bool = False):
+        self._check_rebuildable_topology_capture()
+        if self._cell_grid.device.is_capturing:
+            self._topology_capture_locked = True
+
         self._cell_grid.get_voxels(out=self._cell_ijk)
 
         _fill_rebuildable_node_candidates(
             self._cell_grid, self._cell_ijk, self._node_candidates, self._node_candidate_mask
         )
-        self._node_grid.rebuild(self._node_candidates.flatten(), point_mask=self._node_candidate_mask)
+        node_status = self._node_rebuild_status if status is not None and preserve_status else status
+        self._node_grid.rebuild(
+            self._node_candidates.flatten(), status=node_status, point_mask=self._node_candidate_mask
+        )
         self._node_grid.get_voxels(out=self._node_ijk)
 
         self._face_grid = None
@@ -1194,7 +1237,26 @@ class Nanogrid(NanogridBase):
             _fill_rebuildable_edge_candidates(
                 self._cell_grid, self._cell_ijk, self._edge_candidates, self._edge_candidate_mask
             )
-            self._edge_grid.rebuild(self._edge_candidates.flatten(), point_mask=self._edge_candidate_mask)
+            self._edge_grid.rebuild(
+                self._edge_candidates.flatten(),
+                status=self._edge_rebuild_status if status is not None else None,
+                point_mask=self._edge_candidate_mask,
+            )
+
+        if status is not None:
+            status_view = _nanogrid_rebuild_status_view(status)
+            wp.launch(
+                _aggregate_nanogrid_rebuild_status,
+                dim=1,
+                inputs=[
+                    status_view,
+                    node_status if preserve_status else status_view,
+                    self._edge_rebuild_status,
+                    int(self._edge_candidates is not None),
+                    int(preserve_status),
+                ],
+                device=self._cell_grid.device,
+            )
 
         self.cell_arg_value.invalidate(self)
         self.side_arg_value.invalidate(self)
@@ -1615,6 +1677,19 @@ def _pack_environment_voxels_world(
     )
 
 
+def _nanogrid_rebuild_status_view(status: wp.array) -> wp.array:
+    status_view = wp.array(
+        data=None,
+        ptr=status.ptr,
+        capacity=status.capacity,
+        device=status.device,
+        dtype=wp.uint32,
+        shape=1,
+    )
+    status_view._ref = status
+    return status_view
+
+
 def _nanogrid_rebuild_points_array(points: wp.array, device) -> wp.array:
     if not isinstance(points, wp.array) or not points.is_contiguous:
         raise RuntimeError(
@@ -1707,6 +1782,22 @@ def _fill_cell_env_from_world_points_masked(
 
 
 # -- Topology-building kernels (precision-independent) --
+
+
+@wp.kernel
+def _aggregate_nanogrid_rebuild_status(
+    status: wp.array(dtype=wp.uint32),
+    node_status: wp.array(dtype=wp.uint32),
+    edge_status: wp.array(dtype=wp.uint32),
+    include_edge: int,
+    preserve_status: int,
+):
+    value = node_status[0]
+    if include_edge != 0:
+        value = value | edge_status[0]
+    if preserve_status != 0:
+        value = value | status[0]
+    status[0] = value
 
 
 @wp.kernel

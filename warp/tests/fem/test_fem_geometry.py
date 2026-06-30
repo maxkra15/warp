@@ -495,6 +495,169 @@ def test_nanogrid_rebuild_edge_capacity(test, device):
     test.assertGreaterEqual(capacity.max_leaf_node_count, active.leaf_node_count)
 
 
+def test_nanogrid_rebuild_edge_hierarchy_capacity(test, device):
+    points_initial = wp.array([[0, 0, 0]], dtype=wp.int32, device=device)
+    points_rebuild = wp.array([[4095, 4095, 4095]], dtype=wp.int32, device=device)
+    status = wp.zeros(1, dtype=wp.uint32, device=device)
+
+    volume = wp.Volume.allocate_by_voxels(
+        points_initial,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=1,
+        max_leaf_nodes=1,
+        max_lower_nodes=1,
+        max_upper_nodes=1,
+        status=status,
+    )
+    geo = fem.Nanogrid(volume, rebuildable=True)
+    edge_grid = geo.edge_grid
+    edge_grid_id = edge_grid.id
+
+    geo.rebuild(points_rebuild, status=status)
+    wp.synchronize_device(device)
+
+    test.assertEqual(int(status.numpy()[0]), wp.Volume.REBUILD_SUCCESS)
+    test.assertIs(geo.edge_grid, edge_grid)
+    test.assertEqual(geo.edge_grid.id, edge_grid_id)
+
+    active = edge_grid.get_active_stats()
+    test.assertEqual(active.voxel_count, 12)
+    test.assertEqual(active.leaf_node_count, 12)
+    test.assertEqual(active.lower_node_count, 12)
+    test.assertEqual(active.upper_node_count, 12)
+
+    capacity = edge_grid.get_rebuild_info()
+    test.assertEqual(capacity.max_voxel_count, 12)
+    test.assertEqual(capacity.max_leaf_node_count, 12)
+    test.assertEqual(capacity.max_lower_node_count, 12)
+    test.assertEqual(capacity.max_upper_node_count, 12)
+
+
+def test_nanogrid_rebuild_auxiliary_status(test, device):
+    points = wp.array([[0, 0, 0]], dtype=wp.int32, device=device)
+    status = wp.zeros(1, dtype=wp.uint32, device=device)
+
+    volume = wp.Volume.allocate_by_voxels(
+        points,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=1,
+        max_leaf_nodes=1,
+        max_lower_nodes=1,
+        max_upper_nodes=1,
+        status=status,
+    )
+    geo = fem.Nanogrid(volume, rebuildable=True)
+    test.assertEqual(geo.edge_grid.get_active_stats().voxel_count, 12)
+
+    geo._edge_grid = wp.Volume.allocate_by_voxels(
+        points,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=1,
+        max_leaf_nodes=1,
+        max_lower_nodes=1,
+        max_upper_nodes=1,
+    )
+    geo._edge_count = 1
+
+    geo.rebuild(points, status=status)
+    test.assertTrue(int(status.numpy()[0]) & wp.Volume.REBUILD_VOXEL_CAPACITY_EXCEEDED)
+
+    status.zero_()
+    geo.rebuild_topology_from_cells(status=status)
+    test.assertTrue(int(status.numpy()[0]) & wp.Volume.REBUILD_VOXEL_CAPACITY_EXCEEDED)
+
+    if device.is_cuda:
+        status.zero_()
+        geo._edge_rebuild_status.zero_()
+        wp.synchronize_device(device)
+        with wp.ScopedCapture(device=device, force_module_load=False) as capture:
+            geo.rebuild(points, status=status)
+
+        for _ in range(2):
+            status.zero_()
+            geo._edge_rebuild_status.zero_()
+            wp.synchronize_device(device)
+            wp.capture_launch(capture.graph)
+            wp.synchronize_device(device)
+            test.assertTrue(int(status.numpy()[0]) & wp.Volume.REBUILD_VOXEL_CAPACITY_EXCEEDED)
+
+    cell_status = wp.zeros(1, dtype=wp.uint32, device=device)
+    cell_volume = wp.Volume.allocate_by_voxels(
+        points,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=1,
+        max_leaf_nodes=1,
+        max_lower_nodes=1,
+        max_upper_nodes=1,
+        status=cell_status,
+    )
+    cell_geo = fem.Nanogrid(cell_volume, rebuildable=True)
+    test.assertEqual(cell_geo.edge_grid.get_active_stats().voxel_count, 12)
+
+    two_points = wp.array([[0, 0, 0], [1, 0, 0]], dtype=wp.int32, device=device)
+    cell_geo.rebuild(two_points, status=cell_status)
+    test.assertTrue(int(cell_status.numpy()[0]) & wp.Volume.REBUILD_VOXEL_CAPACITY_EXCEEDED)
+    test.assertEqual(int(cell_geo._node_rebuild_status.numpy()[0]), wp.Volume.REBUILD_SUCCESS)
+    test.assertEqual(int(cell_geo._edge_rebuild_status.numpy()[0]), wp.Volume.REBUILD_SUCCESS)
+
+    if device.is_cuda:
+        cell_status.zero_()
+        wp.synchronize_device(device)
+        with wp.ScopedCapture(device=device, force_module_load=False) as capture:
+            cell_geo.rebuild(two_points, status=cell_status)
+
+        for _ in range(2):
+            cell_status.zero_()
+            wp.synchronize_device(device)
+            wp.capture_launch(capture.graph)
+            wp.synchronize_device(device)
+            test.assertTrue(int(cell_status.numpy()[0]) & wp.Volume.REBUILD_VOXEL_CAPACITY_EXCEEDED)
+            test.assertEqual(int(cell_geo._node_rebuild_status.numpy()[0]), wp.Volume.REBUILD_SUCCESS)
+            test.assertEqual(int(cell_geo._edge_rebuild_status.numpy()[0]), wp.Volume.REBUILD_SUCCESS)
+
+    status_sentinel = 32
+    for status_shape in ((1, 1), (1, 1, 1), (1, 1, 1, 1), (2, 2)):
+        shaped_status = wp.full(status_shape, status_sentinel, dtype=wp.uint32, device=device)
+
+        geo.rebuild(points, status=shaped_status)
+        shaped_status_np = shaped_status.numpy().reshape(-1)
+        test.assertTrue(int(shaped_status_np[0]) & wp.Volume.REBUILD_VOXEL_CAPACITY_EXCEEDED)
+        np.testing.assert_array_equal(
+            shaped_status_np[1:], np.full(shaped_status.size - 1, status_sentinel, dtype=np.uint32)
+        )
+
+        shaped_status.fill_(status_sentinel)
+        geo.rebuild_topology_from_cells(status=shaped_status)
+        shaped_status_np = shaped_status.numpy().reshape(-1)
+        test.assertTrue(int(shaped_status_np[0]) & wp.Volume.REBUILD_VOXEL_CAPACITY_EXCEEDED)
+        np.testing.assert_array_equal(
+            shaped_status_np[1:], np.full(shaped_status.size - 1, status_sentinel, dtype=np.uint32)
+        )
+
+    status_storage = wp.full(4, status_sentinel, dtype=wp.uint32, device=device)
+    strided_status = status_storage[1::2]
+    test.assertFalse(strided_status.is_contiguous)
+
+    geo.rebuild(points, status=strided_status)
+    status_storage_np = status_storage.numpy()
+    test.assertTrue(int(status_storage_np[1]) & wp.Volume.REBUILD_VOXEL_CAPACITY_EXCEEDED)
+    np.testing.assert_array_equal(status_storage_np[[0, 2, 3]], np.full(3, status_sentinel, dtype=np.uint32))
+
+    status_storage.fill_(status_sentinel)
+    geo.rebuild_topology_from_cells(status=strided_status)
+    status_storage_np = status_storage.numpy()
+    test.assertTrue(int(status_storage_np[1]) & wp.Volume.REBUILD_VOXEL_CAPACITY_EXCEEDED)
+    np.testing.assert_array_equal(status_storage_np[[0, 2, 3]], np.full(3, status_sentinel, dtype=np.uint32))
+
+
 def test_nanogrid_rebuild_capture(test, device):
     test.assertTrue(fem.Nanogrid.REBUILDABLE_EDGE_TOPOLOGY)
 
@@ -525,6 +688,10 @@ def test_nanogrid_rebuild_capture(test, device):
     test.assertEqual(geo.vertex_count(), 32)
     test.assertEqual(space.topology._vertex_grid, vertex_grid_id)
     test.assertEqual(space.topology._edge_grid, edge_grid.id)
+    test.assertEqual(geo.edge_count(), 48)
+    test.assertEqual(edge_grid.get_rebuild_info().max_voxel_count, 48)
+    test.assertEqual(edge_grid.get_active_stats().voxel_count, 12)
+    test.assertEqual(space.node_count(), 80)
 
     wp.launch(
         _nanogrid_volume_counts,
@@ -554,6 +721,10 @@ def test_nanogrid_rebuild_capture(test, device):
     test.assertIs(geo.edge_grid, edge_grid)
     test.assertEqual(space.topology._vertex_grid, geo.vertex_grid.id)
     test.assertEqual(space.topology._edge_grid, edge_grid.id)
+    test.assertEqual(edge_grid.get_active_stats().voxel_count, 32)
+    test.assertEqual(geo.edge_count(), 48)
+    test.assertEqual(edge_grid.get_rebuild_info().max_voxel_count, 48)
+    test.assertEqual(space.node_count(), 80)
     np.testing.assert_array_equal(counts.numpy(), np.array([3, 20, 32]))
 
     cell_mask = wp.zeros(geo.cell_count(), dtype=int, device=device)
@@ -567,6 +738,173 @@ def test_nanogrid_rebuild_capture(test, device):
     voxels_np = voxels_np[np.any(voxels_np != -999, axis=1)]
     voxels_np = voxels_np[np.lexsort(voxels_np.T[::-1])]
     np.testing.assert_array_equal(voxels_np, np.array([[0, 0, 0], [1, 0, 0], [3, 0, 0]], dtype=np.int32))
+
+
+def test_nanogrid_rebuild_capture_topology_lock(test, device):
+    points = wp.array([[0, 0, 0]], dtype=wp.int32, device=device)
+    two_points = wp.array([[0, 0, 0], [1, 0, 0]], dtype=wp.int32, device=device)
+
+    volume = wp.Volume.allocate_by_voxels(
+        points,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=1,
+        max_leaf_nodes=1,
+        max_lower_nodes=1,
+        max_upper_nodes=1,
+    )
+    geo = fem.Nanogrid(volume, rebuildable=True)
+
+    wp.load_module(device=device)
+
+    invalid_volume = wp.Volume.allocate_by_voxels(
+        points,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=1,
+        max_leaf_nodes=1,
+        max_lower_nodes=1,
+        max_upper_nodes=1,
+    )
+    unprepared_geo = fem.Nanogrid(invalid_volume, rebuildable=True)
+    invalid_points = wp.array([[0, 0]], dtype=wp.int32, device=device)
+
+    with wp.ScopedCapture(device=device, force_module_load=False):
+        with test.assertRaisesRegex(RuntimeError, "points must be contiguous"):
+            unprepared_geo.rebuild(invalid_points)
+
+    try:
+        unprepared_space = fem.make_polynomial_space(
+            unprepared_geo, degree=2, element_basis=fem.ElementBasis.SERENDIPITY
+        )
+    except RuntimeError as exc:
+        test.fail(f"Validation-only capture failure locked unprepared topology: {exc}")
+    test.assertEqual(unprepared_space.topology._edge_grid, unprepared_geo.edge_grid.id)
+
+    invalid_status_volume = wp.Volume.allocate_by_voxels(
+        points,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=1,
+        max_leaf_nodes=1,
+        max_lower_nodes=1,
+        max_upper_nodes=1,
+    )
+    unprepared_status_geo = fem.Nanogrid(invalid_status_volume, rebuildable=True)
+    invalid_status = wp.zeros(1, dtype=wp.int32, device=device)
+
+    with wp.ScopedCapture(device=device, force_module_load=False):
+        with test.assertRaisesRegex(
+            RuntimeError, "^status must be a Warp array with dtype uint32 and at least one element$"
+        ):
+            unprepared_status_geo.rebuild_topology_from_cells(status=invalid_status)
+
+    try:
+        unprepared_status_space = fem.make_polynomial_space(
+            unprepared_status_geo, degree=2, element_basis=fem.ElementBasis.SERENDIPITY
+        )
+    except RuntimeError as exc:
+        test.fail(f"Invalid topology status locked unprepared topology: {exc}")
+    test.assertEqual(unprepared_status_space.topology._edge_grid, unprepared_status_geo.edge_grid.id)
+
+    with wp.ScopedCapture(device=device, force_module_load=False):
+        with test.assertRaisesRegex(RuntimeError, "face topology"):
+            geo.side_count()
+        geo.rebuild(points)
+
+    with test.assertRaisesRegex(RuntimeError, "face topology"):
+        geo.side_count()
+    with test.assertRaisesRegex(RuntimeError, "before CUDA graph capture"):
+        fem.make_polynomial_space(geo, degree=2, element_basis=fem.ElementBasis.SERENDIPITY)
+
+    volume_with_faces = wp.Volume.allocate_by_voxels(
+        points,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=2,
+        max_leaf_nodes=2,
+        max_lower_nodes=2,
+        max_upper_nodes=2,
+    )
+    geo_with_faces = fem.Nanogrid(volume_with_faces, rebuildable=True)
+    face_count = geo_with_faces.side_count()
+    capture_buffer = wp.zeros(1, dtype=wp.int32, device=device)
+    initial_vertex_count = geo_with_faces.vertex_grid.get_active_stats().voxel_count
+    initial_face_count = geo_with_faces.face_grid.get_active_stats().voxel_count
+
+    test.assertEqual(geo_with_faces.cell_grid.get_active_stats().voxel_count, 1)
+
+    with wp.ScopedCapture(device=device, force_module_load=False):
+        try:
+            captured_face_count = geo_with_faces.side_count()
+        except RuntimeError as exc:
+            test.fail(f"Materialized face topology access failed during CUDA graph capture: {exc}")
+        test.assertEqual(captured_face_count, face_count)
+        capture_buffer.fill_(1)
+
+    capture = wp.ScopedCapture(device=device, force_module_load=False)
+    with test.assertRaisesRegex(RuntimeError, "face topology"):
+        with capture:
+            capture_buffer.fill_(2)
+            geo_with_faces.rebuild(two_points)
+
+    wp.capture_launch(capture.graph)
+    wp.synchronize_device(device)
+
+    test.assertEqual(geo_with_faces.cell_grid.get_active_stats().voxel_count, 1)
+    test.assertEqual(geo_with_faces.vertex_grid.get_active_stats().voxel_count, initial_vertex_count)
+    test.assertEqual(geo_with_faces.face_grid.get_active_stats().voxel_count, initial_face_count)
+
+
+def test_nanogrid_rebuild_face_topology(test, device):
+    points = wp.array([[0, 0, 0]], dtype=wp.int32, device=device)
+    volume = wp.Volume.allocate_by_voxels(
+        points,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=1,
+        max_leaf_nodes=1,
+        max_lower_nodes=1,
+        max_upper_nodes=1,
+    )
+    geo = fem.Nanogrid(volume, rebuildable=True)
+
+    with test.assertRaisesRegex(NotImplementedError, "Face-noded spaces"):
+        fem.make_polynomial_space(geo, degree=2)
+
+
+def test_nanogrid_rebuild_bspline_topology(test, device):
+    points = wp.array([[0, 0, 0]], dtype=wp.int32, device=device)
+    volume = wp.Volume.allocate_by_voxels(
+        points,
+        voxel_size=1.0,
+        device=device,
+        rebuildable=True,
+        max_active_voxels=1,
+        max_leaf_nodes=1,
+        max_lower_nodes=1,
+        max_upper_nodes=1,
+    )
+    geo = fem.Nanogrid(volume, rebuildable=True)
+
+    linear_space = fem.make_polynomial_space(geo, degree=1, element_basis=fem.ElementBasis.BSPLINE)
+    test.assertIs(linear_space.topology._padded_node_grid, geo.vertex_grid)
+    test.assertEqual(linear_space.node_count(), geo.vertex_count())
+
+    for degree in (2, 3):
+        with test.subTest(degree=degree):
+            with test.assertRaisesRegex(NotImplementedError, "B-spline.*rebuildable Nanogrids"):
+                fem.make_polynomial_space(geo, degree=degree, element_basis=fem.ElementBasis.BSPLINE)
+
+    fixed_volume = wp.Volume.allocate_by_voxels(points, voxel_size=1.0, device=device)
+    fixed_geo = fem.Nanogrid(fixed_volume)
+    quadratic_space = fem.make_polynomial_space(fixed_geo, degree=2, element_basis=fem.ElementBasis.BSPLINE)
+    test.assertGreater(quadratic_space.node_count(), fixed_geo.vertex_count())
 
 
 def test_nanogrid_guess_lookup_radius(test, device):
@@ -878,7 +1216,31 @@ add_function_test(TestFemGeometry, "test_nanogrid_rebuild", test_nanogrid_rebuil
 add_function_test(
     TestFemGeometry, "test_nanogrid_rebuild_edge_capacity", test_nanogrid_rebuild_edge_capacity, devices=cuda_devices
 )
+add_function_test(
+    TestFemGeometry,
+    "test_nanogrid_rebuild_edge_hierarchy_capacity",
+    test_nanogrid_rebuild_edge_hierarchy_capacity,
+    devices=devices,
+)
+add_function_test(
+    TestFemGeometry, "test_nanogrid_rebuild_auxiliary_status", test_nanogrid_rebuild_auxiliary_status, devices=devices
+)
 add_function_test(TestFemGeometry, "test_nanogrid_rebuild_capture", test_nanogrid_rebuild_capture, devices=cuda_devices)
+add_function_test(
+    TestFemGeometry,
+    "test_nanogrid_rebuild_capture_topology_lock",
+    test_nanogrid_rebuild_capture_topology_lock,
+    devices=cuda_devices,
+)
+add_function_test(
+    TestFemGeometry, "test_nanogrid_rebuild_face_topology", test_nanogrid_rebuild_face_topology, devices=devices
+)
+add_function_test(
+    TestFemGeometry,
+    "test_nanogrid_rebuild_bspline_topology",
+    test_nanogrid_rebuild_bspline_topology,
+    devices=devices,
+)
 add_function_test(
     TestFemGeometry, "test_nanogrid_guess_lookup_radius", test_nanogrid_guess_lookup_radius, devices=cuda_devices
 )

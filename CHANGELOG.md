@@ -39,8 +39,9 @@
   backward replay to avoid incorrect gradients ([GH-1443](https://github.com/NVIDIA/warp/issues/1443)).
 - Add rebuildable NanoVDB volumes with capacity/status controls, point masks, CPU parity, and CUDA graph-capturable
   rebuilds. `warp.fem.Nanogrid` topology refresh supports vertex-only and vertex-plus-edge Serendipity spaces over
-  rebuildable volumes; face-noded spaces remain unsupported. Add an `example_apic_fluid` path that exercises captured
-  grid rebuilds.
+  rebuildable volumes; face-noded spaces remain unsupported. Nanogrid rebuild status includes prepared auxiliary
+  topology, and captured refreshes reject later topology materialization. Add an `example_apic_fluid` path that
+  exercises captured grid rebuilds.
 - Add row-capacity support to `warp.sparse` BSR matrices, including padded topology policies for topology-changing
   sparse operations, `bsr_zeros(row_capacity=...)` for reserving row capacity, `bsr_compress()` for inplace compaction of sparse matrices, and sparse status constants for overflow checks ([GH-1537](https://github.com/NVIDIA/warp/issues/1537)).
 - `fem.integrate()` and `fem.interpolate()` can now leverage `sparse.bsr_compress()` to perform inplace matrix assembly, reducing peak memory usage ([GH-1537](https://github.com/NVIDIA/warp/issues/1537)).
